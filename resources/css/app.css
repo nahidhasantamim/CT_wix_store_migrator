@@ -1,0 +1,25 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+@import "flowbite/src/themes/default";
+@plugin "flowbite/plugin";
+
+[aria-selected="true"] {
+    @apply bg-white text-gray-900 dark:bg-gray-900 dark:text-white border-b-2 border-blue-500;
+}
+[aria-selected="false"] {
+    @apply bg-gray-50 text-gray-500 hover:bg-gray-100 dark:bg-gray-700 dark:text-gray-400 dark:hover:bg-gray-600;
+}
+/* Rotate icon only when its button is expanded */
+[data-accordion] [aria-expanded="true"] [data-accordion-icon] {
+    transform: rotate(180deg);
+}
+
+.datatable-wrapper .datatable-bottom .datatable-pagination .datatable-pagination-list-item-link {
+    color: var(--color-gray-500) !important;
+    padding: 5px !important;
+}
+
+.datatable-wrapper .datatable-bottom .datatable-pagination .datatable-pagination-list-item-link:hover {
+    color: var(--color-gray-600) !important;
+}
