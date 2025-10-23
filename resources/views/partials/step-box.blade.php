@@ -79,60 +79,140 @@
 
         {{-- Actions --}}
         <div class="mt-4 grid w-full gap-3">
-          {{-- @if ($isContactsMembers) --}}
-            {{-- Contacts block --}}
-            {{-- <div class="rounded-lg border border-gray-700 bg-gray-800 p-3 sm:p-4">
-              <h3 class="text-sm font-semibold text-white mb-2">Contacts</h3>
-              <div class="flex flex-col sm:flex-row gap-2">
-                <a href="{{ route('wix.export.contacts', $store) }}"
-                   class="inline-flex flex-1 items-center justify-center rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500/60">
-                  Export 
-                </a>
-                <form action="{{ route('wix.import.contacts', $store) }}" method="POST" enctype="multipart/form-data" class="flex-1">
-                  @csrf
-                  <div class="relative">
-                    <input type="file" name="contacts_json" id="contacts_json_{{ $idx }}_{{ $store->id }}" accept=".json"
-                           class="block w-full cursor-pointer rounded-lg border border-gray-600 bg-gray-900 text-sm text-gray-200 file:mr-2 file:cursor-pointer file:rounded-l-lg file:border-0 file:bg-gray-700 file:px-3 file:py-2 file:text-gray-100 focus:border-blue-500 focus:ring-blue-500" required>
-                    <button type="submit"
-                            class="mt-2 inline-flex w-full items-center justify-center rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500/60 sm:absolute sm:top-0 sm:right-0 sm:mt-0 sm:h-full sm:w-auto sm:rounded-l-none">
-                      Import
-                    </button>
-                  </div>
-                </form>
-              </div>
-            </div> --}}
 
-            {{-- Members block --}}
-            {{-- <div class="rounded-lg border border-gray-700 bg-gray-800 p-3 sm:p-4">
-              <h3 class="text-sm font-semibold text-white mb-2">Members</h3>
-              <div class="flex flex-col sm:flex-row gap-2">
-                <a href="{{ route('wix.export.members', $store) }}"
-                   class="inline-flex flex-1 items-center justify-center rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500/60">
-                  Export 
-                </a>
-                <form action="{{ route('wix.import.members', $store) }}" method="POST" enctype="multipart/form-data" class="flex-1">
-                  @csrf
-                  <div class="relative">
-                    <input type="file" name="members_json" id="members_json_{{ $idx }}_{{ $store->id }}" accept=".json"
-                           class="block w-full cursor-pointer rounded-lg border border-gray-600 bg-gray-900 text-sm text-gray-200 file:mr-2 file:cursor-pointer file:rounded-l-lg file:border-0 file:bg-gray-700 file:px-3 file:py-2 file:text-gray-100 focus:border-blue-500 focus:ring-blue-500" required>
-                    <button type="submit"
-                            class="mt-2 inline-flex w-full items-center justify-center rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500/60 sm:absolute sm:top-0 sm:right-0 sm:mt-0 sm:h-full sm:w-auto sm:rounded-l-none">
-                      Import
-                    </button>
-                  </div>
-                </form>
-              </div>
-            </div> --}}
-          {{-- @else --}}
             @php $conf = $routeMap[$title] ?? null; @endphp
             @if ($conf)
               {{-- Export --}}
               <div class="rounded-lg border border-gray-700 bg-gray-800 p-3 sm:p-4">
                 <h3 class="text-sm font-semibold text-white mb-2 text-center">Export {{ $conf['label'] }}</h3>
-                <a href="{{ route($conf['export'], $store) }}"
-                   class="inline-flex w-full items-center justify-center rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500/60">
-                  Download 
-                </a>
+
+                @if (($conf['key'] ?? null) === 'orders')
+                  {{-- Orders export: optional date range filter --}}
+                  {{-- Orders export: optional date range filter + limit --}}
+                  <form action="{{ route($conf['export'], $store) }}" method="GET" class="space-y-3" x-data="{ useRange: false }">
+                    {{-- Enable date range filter --}}
+                    <label class="inline-flex items-center gap-2 text-sm text-gray-200">
+                      <input type="checkbox" name="use_date_range" value="1"
+                            x-model="useRange"
+                            class="h-4 w-4 rounded border-gray-600 bg-gray-700 text-blue-600 focus:ring-blue-500">
+                      Filter by order creation date
+                    </label>
+
+                    {{-- Date inputs --}}
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-2"
+                        :class="{ 'opacity-100': useRange, 'opacity-60': !useRange }">
+                      <div>
+                        <label class="block text-xs text-gray-300 mb-1" for="date_from_{{ $idx }}_{{ $store->id }}">Start date</label>
+                        <input type="date" name="created_from" id="date_from_{{ $idx }}_{{ $store->id }}"
+                              class="w-full rounded-md border border-gray-600 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:ring-blue-500"
+                              :disabled="!useRange">
+                      </div>
+                      <div>
+                        <label class="block text-xs text-gray-300 mb-1" for="date_to_{{ $idx }}_{{ $store->id }}">End date</label>
+                        <input type="date" name="created_to" id="date_to_{{ $idx }}_{{ $store->id }}"
+                              class="w-full rounded-md border border-gray-600 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:ring-blue-500"
+                              :disabled="!useRange">
+                      </div>
+                    </div>
+
+                    {{-- NEW: hard cap limit --}}
+                    <div>
+                      <label class="block text-xs text-gray-300 mb-1" for="limit_{{ $idx }}_{{ $store->id }}">Max orders (optional)</label>
+                      <input type="number" min="1" name="limit" id="limit_{{ $idx }}_{{ $store->id }}"
+                            class="w-full rounded-md border border-gray-600 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:ring-blue-500"
+                            placeholder="e.g. 200">
+                    </div>
+
+                    <p class="text-[11px] text-gray-400">
+                      Dates are interpreted in <span class="font-medium text-gray-200">Pacific Time (PT)</span>, inclusive start/end of day.
+                    </p>
+
+                    <button type="submit"
+                            class="inline-flex w-full items-center justify-center rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500/60">
+                      Download
+                    </button>
+                  </form>
+
+
+                @elseif (($conf['key'] ?? null) === 'contacts')
+                  {{-- Contacts & Members export: with optional PT date filter + options --}}
+                  <form action="{{ route($conf['export'], $store) }}" method="GET" class="space-y-3" x-data="{ useRange: false }">
+                    {{-- Optional: cap results --}}
+                    <div>
+                      <label class="block text-xs text-gray-300 mb-1" for="max_{{ $idx }}_{{ $store->id }}">Max (optional)</label>
+                      <input type="number" min="1" name="max" id="max_{{ $idx }}_{{ $store->id }}"
+                            class="w-full rounded-md border border-gray-600 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:ring-blue-500"
+                            placeholder="e.g. 500">
+                    </div>
+
+                    {{-- Include toggles --}}
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <label class="inline-flex items-center gap-2 text-sm text-gray-200">
+                        <input type="checkbox" name="include_members" value="1" class="h-4 w-4 rounded border-gray-600 bg-gray-700 text-blue-600 focus:ring-blue-500" checked>
+                        Include Members
+                      </label>
+                      <label class="inline-flex items-center gap-2 text-sm text-gray-200">
+                        <input type="checkbox" name="include_attachments" value="1" class="h-4 w-4 rounded border-gray-600 bg-gray-700 text-blue-600 focus:ring-blue-500" checked>
+                        Include Attachments
+                      </label>
+                    </div>
+
+                    <div class="border-t border-gray-700 pt-3"></div>
+
+                    {{-- Enable date range filter --}}
+                    <label class="inline-flex items-center gap-2 text-sm text-gray-200">
+                      <input type="checkbox" name="use_date_range" value="1"
+                            x-model="useRange"
+                            class="h-4 w-4 rounded border-gray-600 bg-gray-700 text-blue-600 focus:ring-blue-500">
+                      Filter by date range (Pacific Time)
+                    </label>
+
+                    {{-- Date field select + inputs --}}
+                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-2"
+                        :class="{ 'opacity-100': useRange, 'opacity-60': !useRange }">
+                      <div>
+                        <label class="block text-xs text-gray-300 mb-1" for="date_field_{{ $idx }}_{{ $store->id }}">Date Field</label>
+                        <select name="date_field" id="date_field_{{ $idx }}_{{ $store->id }}"
+                                class="w-full rounded-md border border-gray-600 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:ring-blue-500"
+                                :disabled="!useRange">
+                          <option value="created" selected>Created</option>
+                          <option value="updated">Updated</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label class="block text-xs text-gray-300 mb-1" for="start_date_{{ $idx }}_{{ $store->id }}">Start date</label>
+                        <input type="date" name="start_date" id="start_date_{{ $idx }}_{{ $store->id }}"
+                              placeholder="YYYY-MM-DD or DD.MM.YYYY"
+                              class="w-full rounded-md border border-gray-600 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:ring-blue-500"
+                              :disabled="!useRange">
+                      </div>
+                      <div>
+                        <label class="block text-xs text-gray-300 mb-1" for="end_date_{{ $idx }}_{{ $store->id }}">End date</label>
+                        <input type="date" name="end_date" id="end_date_{{ $idx }}_{{ $store->id }}"
+                              placeholder="YYYY-MM-DD or DD.MM.YYYY"
+                              class="w-full rounded-md border border-gray-600 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:ring-blue-500"
+                              :disabled="!useRange">
+                      </div>
+                    </div>
+
+                    <p class="text-[11px] text-gray-400">
+                      Dates are interpreted in <span class="font-medium text-gray-200">America/Los_Angeles</span> (inclusive start/end of day).  
+                      Accepts <code>YYYY-MM-DD</code> or <code>DD.MM.YYYY</code>.
+                    </p>
+
+                    <button type="submit"
+                            class="inline-flex w-full items-center justify-center rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500/60">
+                      Download
+                    </button>
+                  </form>
+
+                @else
+                  {{-- Default export for all other entities --}}
+                  <a href="{{ route($conf['export'], $store) }}"
+                    class="inline-flex w-full items-center justify-center rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500/60">
+                    Download
+                  </a>
+                @endif
               </div>
 
               {{-- Import --}}
@@ -223,23 +303,42 @@
 </div>
 
 {{-- Footer (checkbox gates Next) --}}
-<div class="mt-4 sm:mt-6">
+<div class="mt-4 sm:mt-6" x-data="{ confirmed: false }" x-cloak>
   <div class="sticky bottom-2 sm:static">
     <div class="bg-gray-800/90 backdrop-blur rounded-lg p-3 sm:p-0 flex flex-col items-center sm:bg-transparent">
       <div class="mb-3 flex items-center sm:mb-4">
-        <label for="confirm-{{ $idx }}" class="ml-2 text-sm text-gray-300">If you have already migrated <b class="text-blue-600">"{{ $title }}"</b>. Click on the checbox </label>
+        <label for="confirm-{{ $idx }}" class="ml-2 text-sm text-gray-300">
+          If you have already migrated <b class="text-blue-600">"{{ $title }}"</b>. Click on the checbox
+        </label>
         &nbsp;
-        <input id="confirm-{{ $idx }}" type="checkbox"
-               class="h-4 w-4 rounded border-gray-600 bg-gray-700 text-blue-600 focus:ring-blue-500">
-        
+        <input
+          id="confirm-{{ $idx }}"
+          type="checkbox"
+          class="h-4 w-4 rounded border-gray-600 bg-gray-700 text-blue-600 focus:ring-blue-500"
+          x-model="confirmed"
+        >
       </div>
+
       <div class="flex gap-2 sm:gap-3">
-        <button type="button" class="btn-prev rounded-lg bg-gray-700 px-4 py-2 text-gray-200 hover:bg-gray-600 sm:px-6"
-                {{ $idx == 1 ? 'disabled' : '' }}>Prev</button>
-        <button type="button" class="btn-next hidden rounded-lg bg-blue-600 px-4 py-2 text-white hover:bg-blue-700 sm:px-6">
+        <button
+          type="button"
+          class="btn-prev rounded-lg bg-gray-700 px-4 py-2 text-gray-200 hover:bg-gray-600 sm:px-6"
+          {{ $idx == 1 ? 'disabled' : '' }}
+        >
+          Prev
+        </button>
+
+        <button
+          type="button"
+          class="btn-next rounded-lg bg-blue-600 px-4 py-2 text-white hover:bg-blue-700 sm:px-6"
+          :class="{ 'hidden': !confirmed }"
+          :disabled="!confirmed"
+          aria-disabled="true"
+        >
           {{ $idx < 9 ? 'Next' : 'Finish' }}
         </button>
       </div>
     </div>
   </div>
 </div>
+

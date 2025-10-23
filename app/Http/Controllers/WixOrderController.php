@@ -11,6 +11,8 @@ use Illuminate\Database\QueryException;
 use App\Models\WixStore;
 use App\Helpers\WixHelper;
 use App\Models\WixOrderMigration;
+// <<< contact mapping model
+use App\Models\WixContactMigration;
 
 class WixOrderController extends Controller
 {
@@ -18,8 +20,12 @@ class WixOrderController extends Controller
     public function migrateAuto(Request $request)
     {
         $request->validate([
-            'from_store' => 'required|string',
-            'to_store'   => 'required|string|different:from_store',
+            'from_store'   => 'required|string',
+            'to_store'     => 'required|string|different:from_store',
+            // NEW (optional)
+            'limit'        => 'nullable|integer|min:1',
+            'created_from' => 'nullable|string', // YYYY-MM-DD or ISO8601
+            'created_to'   => 'nullable|string', // YYYY-MM-DD or ISO8601
         ]);
 
         $userId = Auth::id() ?: 1;
@@ -45,10 +51,17 @@ class WixOrderController extends Controller
         $fromAuth = $this->authHeader($fromToken);
         $toAuth   = $this->authHeader($toToken);
 
+        // --- NEW: read the optional limit + date filter
+        $max        = $request->integer('limit') ?: null;
+        $createdFrom= $request->input('created_from'); // 'YYYY-MM-DD' or ISO
+        $createdTo  = $request->input('created_to');   // 'YYYY-MM-DD' or ISO
+
         // --- Source refs for enrichment
         $tagsIndexSrc   = $this->listOrderTagsIndex($fromAuth);          // [tagId => meta]
         $orderSettings  = $this->getOrderSettings($fromAuth);            // for optional copy
-        $orderIds       = $this->getWixOrderIds($fromAuth);
+
+        // --- UPDATED: pass limit + date filter into ID fetcher
+        $orderIds = $this->getWixOrderIds($fromAuth, $max, $createdFrom, $createdTo);
         if (isset($orderIds['error'])) {
             WixHelper::log('Auto Order Migration', "Order IDs fetch error: " . ($orderIds['raw'] ?? $orderIds['error']) . '.', 'error');
             return back()->with('error', 'Failed to fetch source orders.');
@@ -184,7 +197,7 @@ class WixOrderController extends Controller
             $sourceOrderId = $srcOrder['id'] ?? null;
             $orderNumber   = $srcOrder['number'] ?? null;
 
-            // Prepare order payload (same as import())
+            // Prepare order payload (same as import()) — but DO NOT strip id/number here (we'll try preserve)
             $order = $srcOrder;
 
             $exportPaymentsRaw  = $srcOrder['transactions']['payments'] ?? [];
@@ -197,9 +210,9 @@ class WixOrderController extends Controller
             // Resolve/export tags into destination IDs
             $order['tags'] = $this->resolveOrderTagsForCreate($toAuth, $order['tags'] ?? [], $tagsIndexSrc);
 
-            // Strip system / incompatible fields
+            // Strip system / incompatible fields (but keep id/number for first attempt)
             unset(
-                $order['id'], $order['number'], $order['createdDate'], $order['updatedDate'],
+                $order['createdDate'], $order['updatedDate'],
                 $order['siteLanguage'], $order['isInternalOrderCreate'], $order['seenByAHuman'],
                 $order['transactions'], $order['fulfillments'], $order['refundability']
             );
@@ -217,8 +230,22 @@ class WixOrderController extends Controller
                 unset($a);
             }
 
-            // Create order on destination
-            $createRes = $this->createOrderInWix($toAuth, $order);
+            // <<< Attach migrated contactId by matching buyer email
+            $buyerEmail = $this->extractBuyerEmail($srcOrder);
+            $destContactId = $this->findDestContactId($userId, $fromId, $toId, $buyerEmail);
+            if ($destContactId) {
+                $order['buyerInfo'] = $order['buyerInfo'] ?? [];
+                $order['buyerInfo']['contactId'] = $destContactId;
+            }
+
+            // Create order on destination with best-effort ID/number preservation
+            $createRes = $this->createOrderInWixPreserveIdNumber(
+                $toAuth,
+                $order,
+                $srcOrder['id']     ?? null,   // try same ID
+                $srcOrder['number'] ?? null    // try same number
+            );
+
             if (!isset($createRes['order']['id'])) {
                 $errMsg   = json_encode(['sent' => $this->redactLarge($order), 'response' => $createRes]);
                 $claimed  = $claimPendingRow($sourceOrderId);
@@ -356,11 +383,16 @@ class WixOrderController extends Controller
         }
         $auth = $this->authHeader($accessToken);
 
+        // --- NEW: optional controls
+        $max         = $request->integer('limit') ?: null;
+        $createdFrom = $request->input('created_from'); // 'YYYY-MM-DD' or ISO
+        $createdTo   = $request->input('created_to');   // 'YYYY-MM-DD' or ISO
+
         // 0) Tags index (Orders FQDN)
         $tagsIndex = $this->listOrderTagsIndex($auth); // [tagId => ['name'=>..., ...]]
 
-        // 1) Order IDs
-        $orderIds = $this->getWixOrderIds($auth);
+        // 1) Order IDs (UPDATED call)
+        $orderIds = $this->getWixOrderIds($auth, $max, $createdFrom, $createdTo);
         if (isset($orderIds['error'])) {
             WixHelper::log('Export Orders', "Order IDs fetch error: " . ($orderIds['raw'] ?? $orderIds['error']) . '.', 'error');
             return response()->json(['error' => $orderIds['error']], 500);
@@ -576,13 +608,11 @@ class WixOrderController extends Controller
             $sourceOrderId = $srcOrder['id'] ?? null;
             $orderNumber   = $srcOrder['number'] ?? null;
 
-            // Prepare payload (tags, clean fields)
+            // Prepare payload (tags, clean fields) — keep id/number for first attempt
             $order = $srcOrder;
 
             $exportPaymentsRaw = $srcOrder['transactions']['payments'] ?? [];
-            // Normalize raw → flat list (accepts either wrapper or list)
             $exportPaymentsFlat = $this->normalizePaymentsArray(['payments' => $exportPaymentsRaw]);
-            // Shape each payment to the minimal valid add-payment payload
             $exportPayments     = array_map(fn($p) => $this->shapePaymentForAddPayment($p), $exportPaymentsFlat);
 
             $exportFulfillments = $order['fulfillments']['fulfillments'] ?? [];
@@ -591,7 +621,7 @@ class WixOrderController extends Controller
             $order['tags'] = $this->resolveOrderTagsForCreate($auth, $order['tags'] ?? [], $exportTagsIndex);
 
             unset(
-                $order['id'], $order['number'], $order['createdDate'], $order['updatedDate'],
+                $order['createdDate'], $order['updatedDate'],
                 $order['siteLanguage'], $order['isInternalOrderCreate'], $order['seenByAHuman'],
                 $order['transactions'], $order['fulfillments'], $order['refundability']
             );
@@ -609,8 +639,22 @@ class WixOrderController extends Controller
                 unset($a);
             }
 
-            // ---- Create Order in Wix ----
-            $createRes = $this->createOrderInWix($auth, $order);
+            // <<< Attach migrated contactId by matching buyer email
+            $buyerEmail = $this->extractBuyerEmail($srcOrder);
+            $destContactId = $this->findDestContactId($userId, $fromStoreId, $toStoreId, $buyerEmail);
+            if ($destContactId) {
+                $order['buyerInfo'] = $order['buyerInfo'] ?? [];
+                $order['buyerInfo']['contactId'] = $destContactId;
+            }
+
+            // ---- Create Order in Wix (try preserve id/number, then fallback) ----
+            $createRes = $this->createOrderInWixPreserveIdNumber(
+                $auth,
+                $order,
+                $srcOrder['id']     ?? null,
+                $srcOrder['number'] ?? null
+            );
+
             if (!isset($createRes['order']['id'])) {
                 $errMsg = json_encode(['sent' => $this->redactLarge($order), 'response' => $createRes]);
 
@@ -725,36 +769,123 @@ class WixOrderController extends Controller
         return preg_match('/^Bearer\s+/i', $token) ? $token : ('Bearer ' . $token);
     }
 
-    private function getWixOrderIds(string $auth)
-    {
-        $query = [
-            'sort'   => '[{"dateCreated":"asc"}]',
-            'paging' => ['limit' => 100, 'offset' => 0],
-        ];
-        $orderIds = [];
+// Now supports optional limit + createdDate filter and uses /ecom/v1/orders/search
+private function getWixOrderIds(
+    string $auth,
+    ?int $max = null,
+    ?string $createdFrom = null,
+    ?string $createdTo = null
+) {
+    // --- helpers
+    $fmt = function (?string $d, bool $isEnd = false): ?string {
+        if (!$d) return null;
+        $d = trim($d);
+
+        // Accept YYYY-MM-DD or full ISO; always output ISO with milliseconds + Z
+        if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $d)) {
+            // treat as UTC day
+            return $d . ($isEnd ? 'T23:59:59.999Z' : 'T00:00:00.000Z');
+        }
+
+        // If already ISO, normalize to include .mmmZ
+        // 1) ensure Z
+        if (!preg_match('/Z$/', $d)) {
+            // If it has +hh:mm, convert caller should, but we’ll just append Z as best effort
+            if (!preg_match('/[+-]\d{2}:\d{2}$/', $d)) $d .= 'Z';
+        }
+        // 2) add .000 before Z if missing millis
+        if (!preg_match('/\.\d{3}Z$/', $d)) {
+            $d = preg_replace('/Z$/', '.000Z', $d);
+        }
+        return $d;
+    };
+
+    $gte = $fmt($createdFrom, false);
+    $lte = $fmt($createdTo,   true);
+
+    $max = ($max && $max > 0) ? $max : null;
+
+    // Build the filter as $and of simple clauses (each clause is “field: { $op: value }”)
+    $makeFilter = function (string $field, ?string $gte, ?string $lte): array {
+        $and = [];
+        if ($gte) $and[] = [ $field => [ '$gte' => $gte ] ];
+        if ($lte) $and[] = [ $field => [ '$lte' => $lte ] ];
+        if (!$and) return [];
+        return [ '$and' => $and ];
+    };
+
+    $orderIds = [];
+    $cursor   = null;
+
+    // We will try createdDate first, then purchasedDate (some sites only accept one).
+    $fieldsToTry = [
+        ['field' => 'createdDate',   'label' => 'createdDate'],
+        ['field' => 'purchasedDate', 'label' => 'purchasedDate'],
+    ];
+
+    $lastErr = null;
+
+    foreach ($fieldsToTry as $try) {
+        $cursor     = null;
+        $orderIds   = [];
+        $triesField = $try['field'];
+
         do {
+            $remaining = $max ? ($max - count($orderIds)) : 100;
+            if ($remaining <= 0) break;
+            $pageLimit = max(1, min(100, $remaining));
+
+            $payload = [
+                'search' => [
+                    'sort'         => [ ['fieldName' => 'createdDate', 'order' => 'ASC'] ],
+                    'cursorPaging' => ['limit' => $pageLimit] + ($cursor ? ['cursor' => $cursor] : []),
+                ],
+            ];
+
+            $flt = $makeFilter($triesField, $gte, $lte);
+            if (!empty($flt)) {
+                $payload['search']['filter'] = $flt;
+            }
+
             $resp = Http::withHeaders([
                 'Authorization' => $auth,
                 'Content-Type'  => 'application/json',
-            ])->post('https://www.wixapis.com/stores/v2/orders/query', ['query' => $query]);
+            ])->post('https://www.wixapis.com/ecom/v1/orders/search', $payload);
 
             if (!$resp->ok()) {
-                return ['error' => 'Failed to fetch order IDs from Wix.', 'raw' => $resp->body()];
+                $lastErr = $resp->body();
+                // If we were filtering, switch to the next field name once (createdDate -> purchasedDate)
+                // Only break out of this field; outer loop will try the next.
+                $orderIds = [];
+                break;
             }
 
-            $data       = $resp->json();
-            $ordersPage = $data['orders'] ?? [];
-            foreach ($ordersPage as $row) if (!empty($row['id'])) $orderIds[] = $row['id'];
-
-            $count = count($ordersPage);
-            $query['paging']['offset'] += $count;
-
-            if ($count > 0) {
-                WixHelper::log('Export Orders', "Fetched batch of {$count} order ID(s) (total: " . count($orderIds) . ").", 'debug');
+            $data = $resp->json();
+            foreach (($data['orders'] ?? []) as $row) {
+                if (!empty($row['id'])) {
+                    $orderIds[] = $row['id'];
+                    if ($max && count($orderIds) >= $max) break;
+                }
             }
-        } while ($count > 0);
-        return $orderIds;
+            if ($max && count($orderIds) >= $max) break;
+
+            $cursor = $data['metadata']['pagingMetadata']['cursors']['next'] ?? null;
+        } while ($cursor);
+
+        // success on this field?
+        if ($orderIds) return $orderIds;
+
+        // If we had no filter and no results, that’s still a valid success (empty).
+        if (!$gte && !$lte) return $orderIds;
+        // else: fallthrough to try the other field
     }
+
+    // If we reached here, both field attempts failed with an error while filtering.
+    return ['error' => 'Failed to fetch order IDs from Wix.', 'raw' => $lastErr ?: 'Unknown error'];
+}
+
+
+
 
     private function getWixFullOrder(string $auth, string $orderId): ?array
     {
@@ -851,13 +982,31 @@ class WixOrderController extends Controller
         return false;
     }
 
-    private function createOrderInWix(string $auth, array $order): array
+
+
+
+    // <<< wrapper to try preserving id/number, then fallback
+    private function createOrderInWixPreserveIdNumber(string $auth, array $cleanOrder, ?string $srcId, ?string $srcNumber): array
     {
-        $resp = Http::withHeaders([
-            'Authorization' => $auth,
-            'Content-Type'  => 'application/json',
-        ])->post('https://www.wixapis.com/ecom/v1/orders', ['order' => $order]);
-        return $resp->json();
+        // Attempt 1: id + number
+        $try1 = $cleanOrder;
+        if ($srcId)     $try1['id']     = $srcId;
+        if ($srcNumber) $try1['number'] = $srcNumber;
+
+        $res1 = $this->createOrderInWix($auth, $try1);
+        if (!empty($res1['order']['id'])) return $res1;
+
+        // Attempt 2: number only (remove id)
+        $try2 = $cleanOrder;
+        if ($srcNumber) $try2['number'] = $srcNumber;
+
+        $res2 = $this->createOrderInWix($auth, $try2);
+        if (!empty($res2['order']['id'])) return $res2;
+
+        // Attempt 3: neither (let Wix generate)
+        $try3 = $cleanOrder;
+        unset($try3['id'], $try3['number']);
+        return $this->createOrderInWix($auth, $try3);
     }
 
     private function createFulfillmentInWix(string $auth, string $orderId, array $fulfillment): array
@@ -877,6 +1026,192 @@ class WixOrderController extends Controller
         if ($resp->ok()) return ['success' => true];
         return ['success' => false, 'error' => $resp->body()];
     }
+
+
+    // Put this alongside your other private helpers
+// 1) Stronger sanitizer + validator
+private function sanitizeOrderForCreate(array $order, array &$violations = []): array
+{
+    // --- decode any stringified JSON (e.g. "{}" / "[]")
+    $decodeJsonish = function (&$v) {
+        if (is_string($v) && strlen($v) && ($v[0] === '{' || $v[0] === '[')) {
+            $dec = json_decode($v, true);
+            if (json_last_error() === JSON_ERROR_NONE) $v = $dec;
+        }
+    };
+    array_walk_recursive($order, function (&$val) use ($decodeJsonish) { $decodeJsonish($val); });
+
+    // --- remove top-level empties quickly
+    foreach ($order as $k => $v) {
+        if ($v === '' || $v === null) unset($order[$k]);
+    }
+
+    // --- whitelist top-level keys we actually want to send (safe set)
+    $whitelist = [
+        'id','number','purchasedDate',
+        'buyerInfo','billingInfo','shippingInfo',
+        'lineItems','priceSummary','tags','customFields','note','channelInfo','language'
+    ];
+    $order = array_intersect_key($order, array_flip($whitelist));
+
+    // --- helper: ensure object (array) at path, else unset & record
+    $ensureObj = function(array &$a, array $path) use (&$violations) {
+        $ref =& $a;
+        foreach ($path as $k) {
+            if (!is_array($ref) || !array_key_exists($k, $ref)) return; // absent is fine
+            $ref =& $ref[$k];
+        }
+        if (!is_array($ref)) {
+            // try to decode if json-ish, else drop
+            if (is_string($ref) && ($ref !== '') && ($ref[0] === '{' || $ref[0] === '[')) {
+                $tmp = json_decode($ref, true);
+                if (json_last_error() === JSON_ERROR_NONE) { $ref = $tmp; return; }
+            }
+            $violations[] = implode('.', $path) . ' expected object';
+            // unset last key
+            $cur =& $a;
+            for ($i = 0; $i < count($path) - 1; $i++) $cur =& $cur[$path[$i]];
+            unset($cur[$path[count($path)-1]]);
+        }
+    };
+
+    // --- helper: ensure array at path
+    $ensureArr = function(array &$a, array $path) use (&$violations) {
+        $ref =& $a;
+        foreach ($path as $k) {
+            if (!is_array($ref) || !array_key_exists($k, $ref)) return;
+            $ref =& $ref[$k];
+        }
+        if (!is_array($ref)) {
+            if (is_string($ref) && ($ref !== '') && $ref[0] === '[') {
+                $tmp = json_decode($ref, true);
+                if (json_last_error() === JSON_ERROR_NONE) { $ref = $tmp; return; }
+            }
+            $violations[] = implode('.', $path) . ' expected array';
+            $cur =& $a;
+            for ($i = 0; $i < count($path) - 1; $i++) $cur =& $cur[$path[$i]];
+            unset($cur[$path[count($path)-1]]);
+        }
+    };
+
+    // --- common object fields that MUST be objects if present
+    foreach ([
+        ['buyerInfo'],
+        ['billingInfo'],
+        ['billingInfo','address'],
+        ['shippingInfo'],
+        ['shippingInfo','address'],
+        ['priceSummary'],
+        ['channelInfo'],
+        ['tags'],
+    ] as $p) { $ensureObj($order, $p); }
+
+    // --- tags must be { privateTags: { tagIds:[] }, tags: { tagIds:[] } }
+    if (isset($order['tags'])) {
+        $coerceGroup = function($g) {
+            if (!is_array($g)) return null;
+            if (isset($g['tagIds'])) {
+                $ids = array_values(array_unique(array_filter((array)$g['tagIds'])));
+                return $ids ? ['tagIds' => $ids] : null;
+            }
+            return null;
+        };
+        $pt = isset($order['tags']['privateTags']) ? $coerceGroup($order['tags']['privateTags']) : null;
+        $tg = isset($order['tags']['tags'])        ? $coerceGroup($order['tags']['tags'])        : null;
+        $out = [];
+        if ($pt) $out['privateTags'] = $pt;
+        if ($tg) $out['tags']        = $tg;
+        if ($out) $order['tags'] = $out; else unset($order['tags']);
+    }
+
+    // --- lineItems must be array of objects with sane shapes
+    $ensureArr($order, ['lineItems']);
+    if (isset($order['lineItems'])) {
+        $clean = [];
+        foreach ($order['lineItems'] as $li) {
+            if (!is_array($li)) continue;
+
+            // productName: if string -> { original: string }
+            if (isset($li['productName']) && !is_array($li['productName'])) {
+                $li['productName'] = ['original' => (string)$li['productName']];
+            }
+
+            // objects that appear often
+            foreach (['physicalProperties','customized','subscriptionInfo'] as $objKey) {
+                if (isset($li[$objKey]) && !is_array($li[$objKey])) unset($li[$objKey]);
+            }
+
+            // quantity int
+            if (isset($li['quantity'])) $li['quantity'] = (int)$li['quantity'];
+
+            // strip system/readonly if slipped in
+            unset($li['id'], $li['rootCatalogItemId'], $li['priceUndetermined'], $li['fixedQuantity'], $li['modifierGroups']);
+
+            // drop empties on this level
+            foreach ($li as $k => $v) if ($v === '' || $v === null) unset($li[$k]);
+
+            if (!empty($li)) $clean[] = $li;
+        }
+        $order['lineItems'] = $clean ?: null;
+        if ($order['lineItems'] === null) unset($order['lineItems']);
+    }
+
+    // --- remove fields that are known to break create
+    unset(
+        $order['transactions'], $order['fulfillments'], $order['refundability'],
+        $order['createdDate'], $order['updatedDate'], $order['seenByAHuman'],
+        $order['isInternalOrderCreate'], $order['siteLanguage'], $order['activities']
+    );
+
+    // --- final tidy of any top-level empty strings/nulls again
+    foreach ($order as $k => $v) {
+        if ($v === '' || $v === null) unset($order[$k]);
+    }
+
+    return $order;
+}
+
+// 2) Updated createOrderInWix that sanitizes, validates, and logs violations
+private function createOrderInWix(string $auth, array $order): array
+{
+    $violations = [];
+    $order = $this->sanitizeOrderForCreate($order, $violations);
+
+    if (!empty($violations)) {
+        // helpful debug line in your existing log stream
+        WixHelper::log('Auto Order Migration', 'Sanitize/validate adjusted payload: ' . implode('; ', $violations), 'debug');
+    }
+
+    // Guard: if productName became empty array, drop it (Wix expects object if present)
+    if (isset($order['lineItems'])) {
+        foreach ($order['lineItems'] as &$li) {
+            if (isset($li['productName']) && $li['productName'] === []) unset($li['productName']);
+        }
+        unset($li);
+    }
+
+    $payload = ['order' => $order];
+
+    $resp = Http::withHeaders([
+        'Authorization' => $auth,
+        'Content-Type'  => 'application/json',
+    ])->post('https://www.wixapis.com/ecom/v1/orders', $payload);
+
+    // If Wix still says "Expected an object", include our violations in the returned structure
+    if (!$resp->ok()) {
+        $body = $resp->json();
+        if (isset($body['message']) && stripos($body['message'], 'expected an object') !== false) {
+            return [
+                'message' => $body['message'],
+                'details' => array_merge($body['details'] ?? [], [['sanitizerViolations' => $violations]]),
+            ];
+        }
+    }
+
+    return $resp->json();
+}
+
+
 
     private function addPaymentsToOrderInWix(string $auth, string $orderId, array $transactions): array
     {
@@ -1407,5 +1742,40 @@ class WixOrderController extends Controller
             }
             throw $e; // unexpected
         }
+    }
+
+    // =========================================================
+    // NEW small helpers for contact mapping & email extraction
+    // =========================================================
+
+    // <<< pull buyer email from common shapes
+    private function extractBuyerEmail(array $order): ?string
+    {
+        $candidates = [
+            $order['buyerInfo']['email'] ?? null,
+            $order['billingInfo']['address']['email'] ?? null,
+            $order['billingInfo']['email'] ?? null,
+            $order['customerInfo']['email'] ?? null,
+        ];
+        foreach ($candidates as $em) {
+            if (is_string($em) && trim($em) !== '') return strtolower(trim($em));
+        }
+        return null;
+    }
+
+    // <<< read contact mapping created during contacts migration
+    private function findDestContactId(int $userId, string $fromStoreId, string $toStoreId, ?string $email): ?string
+    {
+        if (!$email) return null;
+        $row = WixContactMigration::where('user_id', $userId)
+            ->where('from_store_id', $fromStoreId)
+            ->where('to_store_id', $toStoreId)
+            ->whereRaw('LOWER(contact_email) = ?', [strtolower($email)])
+            ->whereIn('status', ['success','imported','done'])
+            ->orderByDesc('id')
+            ->first();
+
+        $id = $row?->destination_contact_id;
+        return is_string($id) && $id !== '' ? $id : null;
     }
 }

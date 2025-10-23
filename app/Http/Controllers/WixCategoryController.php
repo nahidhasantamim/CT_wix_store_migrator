@@ -56,7 +56,7 @@ class WixCategoryController extends Controller
             return back()->with('error', 'Could not get Wix access token(s).');
         }
 
-        // Nicer start log like other modules
+        // Logging niceties
         $fromStore  = \App\Models\WixStore::where('instance_id', $fromId)->first();
         $toStore    = \App\Models\WixStore::where('instance_id', $toId)->first();
         $fromLabel  = $fromStore?->store_name ?: $fromId;
@@ -66,27 +66,98 @@ class WixCategoryController extends Controller
         $srcIsV3 = $this->isCatalogV3(WixHelper::getCatalogVersion($fromToken));
         $dstIsV3 = $this->isCatalogV3(WixHelper::getCatalogVersion($toToken));
 
-        // -------- 1) Fetch source categories (same fallbacks as manual)
+        // ---------- helpers ----------
+        $appNamespace = $this->treeAppNamespaceFromRequest();
+        $treeKey      = $this->treeKeyFromRequest();
+
+        $buildSeoFromDesc = function (?string $desc): ?array {
+            $desc = trim(preg_replace('/\s+/u', ' ', strip_tags((string)$desc)));
+            if ($desc === '') return null;
+            // Reasonable meta length
+            $desc = mb_substr($desc, 0, 300, 'UTF-8');
+            return [
+                'tags' => [[
+                    'type'  => 'meta',
+                    'props' => [
+                        'fields' => [
+                            'name'    => ['stringValue' => 'description'],
+                            'content' => ['stringValue' => $desc],
+                        ]
+                    ],
+                ]]
+            ];
+        };
+
+        $ensureSeoOnPayload = function (array &$payload, array $source) use ($buildSeoFromDesc) {
+            // If seoData missing meta description, build from description
+            $hasMeta = false;
+            if (isset($payload['seoData']['tags']) && is_array($payload['seoData']['tags'])) {
+                foreach ($payload['seoData']['tags'] as $t) {
+                    if (($t['type'] ?? '') === 'meta'
+                        && strtolower($t['props']['fields']['name']['stringValue'] ?? '') === 'description') {
+                        $hasMeta = true; break;
+                    }
+                }
+            }
+            if (!$hasMeta) {
+                $seo = $buildSeoFromDesc($payload['description'] ?? ($source['description'] ?? null));
+                if ($seo) $payload['seoData'] = $seo;
+            }
+        };
+
+        $getV3Detail = function (string $id) use ($toToken, $appNamespace, $treeKey) {
+            return $this->getCategoryByIdV3($toToken, $id, $appNamespace, $treeKey);
+        };
+
+        $patchV3 = function (string $id, array $partial) use ($toToken, $appNamespace, $treeKey, $getV3Detail) {
+            // Need latest revision
+            $detail = $getV3Detail($id);
+            $rev = $detail['category']['revision'] ?? null;
+            if ($rev === null) return ['error' => 'Missing revision'];
+
+            $body = [
+                'category'      => array_merge(['revision' => (string)$rev], $partial),
+                'treeReference' => $this->treeRefArray($appNamespace, $treeKey),
+            ];
+            $resp = Http::withHeaders([
+                'Authorization' => $this->ensureBearer($toToken),
+                'Content-Type'  => 'application/json'
+            ])->patch("https://www.wixapis.com/categories/v1/categories/{$id}", $body);
+            return $resp->json() ?: [];
+        };
+
+        $patchV1 = function (string $id, array $partial) use ($toToken) {
+            $resp = Http::withHeaders([
+                'Authorization' => $this->ensureBearer($toToken),
+                'Content-Type'  => 'application/json'
+            ])->patch("https://www.wixapis.com/stores/v1/collections/{$id}", ['collection' => $partial]);
+            return $resp->json() ?: [];
+        };
+
+        $v1Get = function (string $id) use ($toToken) {
+            return $this->getCollectionByIdV1($toToken, $id, false);
+        };
+
+        // ---------- 1) Fetch source categories ----------
         $categories = [];
         if ($srcIsV3) {
-            $appNamespace = $this->treeAppNamespaceFromRequest();
-            $treeKey      = $this->treeKeyFromRequest();
-            $fields       = $this->exportFieldsV3FromRequest() ?: $this->defaultExportFieldsV3;
+            $fields = $this->exportFieldsV3FromRequest() ?: $this->defaultExportFieldsV3;
+            if (!in_array('DESCRIPTION', $fields, true)) $fields[] = 'DESCRIPTION';
+            if (!in_array('SEO_DATA', $fields, true))    $fields[] = 'SEO_DATA';
 
             $res = $this->queryCategoriesV3All($fromToken, $fields, $appNamespace, $treeKey, true);
             if (($res['failed'] ?? false) || empty($res['categories'])) {
-                WixHelper::log('Auto Category Migration', 'V3 QUERY returned no categories; falling back to SEARCH.', 'warn');
+                WixHelper::log('Auto Category Migration', 'V3 QUERY empty; falling back to SEARCH.', 'warn');
                 $res = $this->searchCategoriesV3All($fromToken, $fields, $appNamespace, $treeKey, true);
             }
             if ((($res['failed'] ?? false) || empty($res['categories'])) && !empty($fields)) {
-                WixHelper::log('Auto Category Migration', 'SEARCH returned no categories; retrying QUERY without fields.', 'warn');
+                WixHelper::log('Auto Category Migration', 'SEARCH empty; retry QUERY without fields.', 'warn');
                 $res = $this->queryCategoriesV3All($fromToken, [], $appNamespace, $treeKey, true);
             }
             $categories = $res['categories'] ?? [];
         } else {
             $v1 = $this->getCollectionsFromWixV1($fromToken);
             $collections = $v1['collections'] ?? [];
-            // normalize to V3-ish shape for reuse below
             $categories = array_map(function ($col) {
                 $cat = [
                     'id'   => $col['id']   ?? null,
@@ -100,9 +171,23 @@ class WixCategoryController extends Controller
                 }
                 return $cat;
             }, $collections);
+
+            // Enrich description if missing
+            foreach ($categories as &$catRef) {
+                if (empty($catRef['description']) && !empty($catRef['id'])) {
+                    $detail = $this->getCollectionByIdV1($fromToken, $catRef['id']);
+                    $full   = $detail['collection'] ?? [];
+                    if (!empty($full['description'])) {
+                        $catRef['description'] = $full['description'];
+                    } elseif (!empty($full['additionalInfo']['description'])) {
+                        $catRef['description'] = $full['additionalInfo']['description'];
+                    }
+                }
+            }
+            unset($catRef);
         }
 
-        // Oldest-first (best effort)
+        // Sort oldest-first
         $createdAtMillis = function (array $item): int {
             foreach (['createdDate','dateCreated','createdAt','creationDate','date_created'] as $k) {
                 if (array_key_exists($k, $item)) {
@@ -122,22 +207,38 @@ class WixCategoryController extends Controller
         };
         usort($categories, fn($a,$b) => $createdAtMillis($a) <=> $createdAtMillis($b));
 
-        // -------- 2) Prepare destination helpers
-        $appNamespace  = $this->treeAppNamespaceFromRequest();
-        $treeKey       = $this->treeKeyFromRequest();
-        $existingSlugs = $dstIsV3 ? $this->getExistingSlugsV3($toToken, $appNamespace, $treeKey) : [];
+        // ---------- 2) Destination indexes ----------
+        $existingSlugs = [];
+        $v3IndexBySlug = $v3IndexByName = $v1IndexBySlug = $v1IndexByName = [];
+        $allProductsIdV3 = null;
 
-        // -------- 3) Stage + import (idempotent)
-        $imported = 0; $failed = 0; $stagedNew = 0; $stagedExisting = 0; $skipped = 0;
+        if ($dstIsV3) {
+            $scan = $this->queryCategoriesV3All($toToken, ['DESCRIPTION','SEO_DATA'], $appNamespace, $treeKey, true);
+            if (empty($scan['categories'])) {
+                $scan = $this->searchCategoriesV3All($toToken, ['DESCRIPTION','SEO_DATA'], $appNamespace, $treeKey, true);
+            }
+            foreach (($scan['categories'] ?? []) as $c) {
+                if (!empty($c['slug'])) $v3IndexBySlug[strtolower($c['slug'])] = $c;
+                if (!empty($c['name'])) $v3IndexByName[strtolower($c['name'])] = $c;
+            }
+            $existingSlugs = $this->getExistingSlugsV3($toToken, $appNamespace, $treeKey);
+            $allProductsIdV3 = $this->getAllProductsCategoryIdV3($toToken);
+        } else {
+            $scan = $this->getCollectionsFromWixV1($toToken);
+            foreach (($scan['collections'] ?? []) as $c) {
+                if (!empty($c['slug'])) $v1IndexBySlug[strtolower($c['slug'])] = $c;
+                if (!empty($c['name'])) $v1IndexByName[strtolower($c['name'])] = $c;
+            }
+        }
+
+        // ---------- 3) Stage + Upsert/Recreate ----------
+        $created = 0; $updated = 0; $recreated = 0; $failed = 0; $skipped = 0; $stagedNew = 0; $stagedExisting = 0;
 
         foreach ($categories as $cat) {
-            // Skip system categories (e.g. All Products) BEFORE staging
-            if ($this->shouldSkipSystemCategory($cat)) { $skipped++; continue; }
-
             $srcId = $cat['id'] ?? null;
             if (!$srcId) continue;
 
-            // Stage a unique row for this (user, from, to, source_id)
+            // ensure we have a row to update
             try {
                 $row = WixCollectionMigration::firstOrCreate(
                     [
@@ -156,7 +257,6 @@ class WixCategoryController extends Controller
                 );
                 $row->wasRecentlyCreated ? $stagedNew++ : $stagedExisting++;
             } catch (\Illuminate\Database\QueryException $e) {
-                // Handle rare race: duplicate key → load existing row and continue
                 if ($e->getCode() === '23000') {
                     $row = WixCollectionMigration::where([
                         ['user_id', '=', $userId],
@@ -165,88 +265,224 @@ class WixCategoryController extends Controller
                         ['source_collection_id', '=', $srcId],
                     ])->first();
                     if (!$row) continue;
-                } else {
-                    throw $e;
+                } else { throw $e; }
+            }
+
+            // Always try to sync—don't early-continue based on status
+
+            // Special case: "All Products" -> UPDATE only
+            if ($this->shouldSkipSystemCategory($cat)) {
+                if ($dstIsV3 && $allProductsIdV3) {
+                    $patch = $this->sanitizeCategoryForCreateV3($cat);
+                    unset($patch['slug']); // keep core slug intact
+                    $ensureSeoOnPayload($patch, $cat);
+
+                    $res = $patchV3($allProductsIdV3, $patch);
+                    if (isset($res['category']['id'])) {
+                        $row->update([
+                            'destination_collection_id' => $allProductsIdV3,
+                            'status'                    => 'success',
+                            'error_message'             => null,
+                            'source_collection_name'    => $cat['name'] ?? $row->source_collection_name,
+                            'source_collection_slug'    => $row->source_collection_slug ?? ($cat['slug'] ?? null),
+                        ]);
+                        $updated++;
+                    } else {
+                        $row->update([
+                            'status'        => 'failed',
+                            'error_message' => json_encode(['patch' => $patch, 'response' => $res]),
+                        ]);
+                        $failed++;
+                    }
+                    continue;
+                }
+
+                // For V1: try to find by slug/name and update (cannot create)
+                if (!$dstIsV3) {
+                    $match = null;
+                    if (!empty($cat['slug'])) $match = $v1IndexBySlug[strtolower($cat['slug'])] ?? null;
+                    if (!$match && !empty($cat['name'])) $match = $v1IndexByName[strtolower($cat['name'])] ?? null;
+
+                    if ($match && !empty($match['id'])) {
+                        $patch = [
+                            'name'        => $cat['name'] ?? $match['name'] ?? '',
+                            'description' => $cat['description'] ?? ($match['description'] ?? null),
+                            'visible'     => array_key_exists('visible', $cat) ? (bool)$cat['visible'] : ($match['visible'] ?? true),
+                        ];
+                        $res = $patchV1($match['id'], $patch);
+                        if (isset($res['collection']['id'])) {
+                            $row->update([
+                                'destination_collection_id' => $match['id'],
+                                'status'                    => 'success',
+                                'error_message'             => null,
+                            ]);
+                            $updated++;
+                        } else {
+                            $row->update(['status' => 'failed', 'error_message' => json_encode(['patch'=>$patch,'response'=>$res])]);
+                            $failed++;
+                        }
+                    } else {
+                        $skipped++; // cannot create system one if not resolvable
+                        $row->update(['status'=>'skipped','error_message'=>'System collection not resolvable for update.']);
+                    }
+                    continue;
                 }
             }
 
-            // If already processed, skip work
-            if (in_array($row->status, ['success','skipped'], true)) { continue; }
-
-            // Build payload & create in destination
             if ($dstIsV3) {
-                $payload      = $this->sanitizeCategoryForCreateV3($cat);
-                $baseForSlug  = $payload['slug'] ?? ($cat['slug'] ?? $payload['name'] ?? 'category');
-                $payload['slug'] = $this->makeUniqueSlug($baseForSlug, $existingSlugs);
+                $payload = $this->sanitizeCategoryForCreateV3($cat);
+                $ensureSeoOnPayload($payload, $cat);
 
-                $res = $this->createCategoryWithDedupeV3(
-                    $toToken,
-                    $payload,
-                    $appNamespace,
-                    $treeKey,
-                    $existingSlugs
-                );
+                // Prefer the row's existing destination id if present
+                $targetId = $row->destination_collection_id ?: null;
+                $exists   = false;
 
-                if (isset($res['category']['id'])) {
-                    $row->update([
-                        'destination_collection_id' => $res['category']['id'],
-                        'status'                    => 'success',
-                        'error_message'             => null,
-                        'source_collection_name'    => $cat['name'] ?? $row->source_collection_name,
-                        'source_collection_slug'    => $row->source_collection_slug ?? ($cat['slug'] ?? null),
-                    ]);
-                    $imported++;
+                if ($targetId) {
+                    $detail = $getV3Detail($targetId);
+                    $exists = !empty($detail['category']['id']);
+                }
+
+                if ($exists) {
+                    // UPDATE
+                    $patch = $payload; unset($patch['slug']);
+                    $res = $patchV3($targetId, $patch);
+                    if (isset($res['category']['id'])) {
+                        $row->update([
+                            'status'                  => 'success',
+                            'error_message'           => null,
+                            'source_collection_name'  => $cat['name'] ?? $row->source_collection_name,
+                            'source_collection_slug'  => $row->source_collection_slug ?? ($cat['slug'] ?? null),
+                        ]);
+                        $updated++;
+                    } else {
+                        $row->update(['status' => 'failed', 'error_message' => json_encode(['patch'=>$patch,'response'=>$res])]);
+                        $failed++;
+                    }
                 } else {
-                    $row->update([
-                        'status'        => 'failed',
-                        'error_message' => json_encode(['sent' => ['category' => $payload, 'treeReference' => $this->treeRefArray($appNamespace,$treeKey)], 'response' => $res]),
-                    ]);
-                    $failed++;
+                    // Try to match by slug or name in target
+                    $match = null;
+                    if (!empty($cat['slug'])) $match = $v3IndexBySlug[strtolower($cat['slug'])] ?? null;
+                    if (!$match && !empty($cat['name'])) $match = $v3IndexByName[strtolower($cat['name'])] ?? null;
+
+                    if ($match && !empty($match['id'])) {
+                        // UPDATE matched one
+                        $patch = $payload; unset($patch['slug']);
+                        $res = $patchV3($match['id'], $patch);
+                        if (isset($res['category']['id'])) {
+                            $row->update([
+                                'destination_collection_id' => $match['id'],
+                                'status'                    => 'success',
+                                'error_message'             => null,
+                                'source_collection_name'    => $cat['name'] ?? $row->source_collection_name,
+                                'source_collection_slug'    => $row->source_collection_slug ?? ($cat['slug'] ?? null),
+                            ]);
+                            $updated++;
+                        } else {
+                            $row->update(['status' => 'failed', 'error_message' => json_encode(['patch'=>$patch,'response'=>$res])]);
+                            $failed++;
+                        }
+                    } else {
+                        // CREATE (also covers "deleted on target" recreate case)
+                        $baseForSlug = $payload['slug'] ?? ($cat['slug'] ?? $payload['name'] ?? 'category');
+                        $payload['slug'] = $this->makeUniqueSlug($baseForSlug, $existingSlugs);
+                        $res = $this->createCategoryWithDedupeV3($toToken, $payload, $appNamespace, $treeKey, $existingSlugs);
+                        if (isset($res['category']['id'])) {
+                            $row->update([
+                                'destination_collection_id' => $res['category']['id'],
+                                'status'                    => 'success',
+                                'error_message'             => null,
+                                'source_collection_name'    => $cat['name'] ?? $row->source_collection_name,
+                                'source_collection_slug'    => $row->source_collection_slug ?? ($cat['slug'] ?? null),
+                            ]);
+                            $recreated += ($targetId ? 1 : 0);
+                            $created   += ($targetId ? 0 : 1);
+                        } else {
+                            $row->update(['status' => 'failed', 'error_message' => json_encode(['sent'=>['category'=>$payload], 'response'=>$res])]);
+                            $failed++;
+                        }
+                    }
                 }
             } else {
-                // Destination V1
-                $res = $this->createCollectionInWixV1($toToken, [
-                    'name'        => $cat['name'] ?? '',
-                    'description' => $cat['description'] ?? null,
-                    'visible'     => array_key_exists('visible', $cat) ? (bool)$cat['visible'] : true,
-                ]);
+                // V1 target
+                $targetId = $row->destination_collection_id ?: null;
+                $exists   = false;
 
-                if (isset($res['collection']['id'])) {
-                    $row->update([
-                        'destination_collection_id' => $res['collection']['id'],
-                        'status'                    => 'success',
-                        'error_message'             => null,
-                        'source_collection_name'    => $cat['name'] ?? $row->source_collection_name,
-                        'source_collection_slug'    => $row->source_collection_slug ?? ($cat['slug'] ?? null),
-                    ]);
-                    $imported++;
+                if ($targetId) {
+                    $detail = $v1Get($targetId);
+                    $exists = !empty($detail['collection']['id']);
+                }
+
+                if ($exists) {
+                    $patch = [
+                        'name'        => $cat['name'] ?? $detail['collection']['name'] ?? '',
+                        'description' => $cat['description'] ?? ($detail['collection']['description'] ?? null),
+                        'visible'     => array_key_exists('visible',$cat) ? (bool)$cat['visible'] : ($detail['collection']['visible'] ?? true),
+                    ];
+                    $res = $patchV1($targetId, $patch);
+                    if (isset($res['collection']['id'])) {
+                        $row->update(['status'=>'success','error_message'=>null]);
+                        $updated++;
+                    } else {
+                        $row->update(['status'=>'failed','error_message'=>json_encode(['patch'=>$patch,'response'=>$res])]);
+                        $failed++;
+                    }
                 } else {
-                    $row->update([
-                        'status'        => 'failed',
-                        'error_message' => json_encode(['sent' => $cat, 'response' => $res]),
-                    ]);
-                    $failed++;
+                    // try to match by slug or name
+                    $match = null;
+                    if (!empty($cat['slug'])) $match = $v1IndexBySlug[strtolower($cat['slug'])] ?? null;
+                    if (!$match && !empty($cat['name'])) $match = $v1IndexByName[strtolower($cat['name'])] ?? null;
+
+                    if ($match && !empty($match['id'])) {
+                        $patch = [
+                            'name'        => $cat['name'] ?? $match['name'] ?? '',
+                            'description' => $cat['description'] ?? ($match['description'] ?? null),
+                            'visible'     => array_key_exists('visible',$cat) ? (bool)$cat['visible'] : ($match['visible'] ?? true),
+                        ];
+                        $res = $patchV1($match['id'], $patch);
+                        if (isset($res['collection']['id'])) {
+                            $row->update([
+                                'destination_collection_id' => $match['id'],
+                                'status' => 'success',
+                                'error_message' => null,
+                            ]);
+                            $updated++;
+                        } else {
+                            $row->update(['status'=>'failed','error_message'=>json_encode(['patch'=>$patch,'response'=>$res])]);
+                            $failed++;
+                        }
+                    } else {
+                        // CREATE (or RE-CREATE)
+                        $res = $this->createCollectionInWixV1($toToken, [
+                            'name'        => $cat['name'] ?? '',
+                            'description' => $cat['description'] ?? null,
+                            'visible'     => array_key_exists('visible',$cat) ? (bool)$cat['visible'] : true,
+                        ]);
+                        if (isset($res['collection']['id'])) {
+                            $row->update([
+                                'destination_collection_id' => $res['collection']['id'],
+                                'status'                    => 'success',
+                                'error_message'             => null,
+                            ]);
+                            $recreated += ($targetId ? 1 : 0);
+                            $created   += ($targetId ? 0 : 1);
+                        } else {
+                            $row->update(['status'=>'failed','error_message'=>json_encode(['sent'=>$cat,'response'=>$res])]);
+                            $failed++;
+                        }
+                    }
                 }
             }
         }
 
-        // -------- Summary + flash (now mirrors other controllers)
-        $summary = "Categories: imported={$imported}, failed={$failed}, skipped(system)={$skipped}, staged(new={$stagedNew}, existing={$stagedExisting}).";
+        $summary = "Categories: created={$created}, updated={$updated}, recreated={$recreated}, failed={$failed}, skipped(system)={$skipped}.";
+        WixHelper::log('Auto Category Migration', "Done. {$summary}", $failed ? 'warn' : 'success');
 
-        if ($imported > 0) {
-            // Partial failures now surface a visible WARNING banner
-            WixHelper::log('Auto Category Migration', "Done. {$summary}", $failed ? 'warn' : 'success');
-            return back()->with($failed ? 'warning' : 'success', $summary);
-        }
-
-        if ($failed > 0) {
-            WixHelper::log('Auto Category Migration', "Done. {$summary}", 'error');
-            return back()->with('error', $summary);
-        }
-
-        WixHelper::log('Auto Category Migration', 'Done. Nothing to import.', 'info');
-        return back()->with('success', 'Nothing to import.');
+        if ($failed && !$created && !$updated && !$recreated) return back()->with('error', $summary);
+        if ($failed) return back()->with('warning', $summary);
+        return back()->with('success', $summary);
     }
+
+
 
 
     // ========================================================= Manual Migrator =========================================================
@@ -273,31 +509,45 @@ class WixCategoryController extends Controller
             // -------- V3 (Categories API)
             $appNamespace = $this->treeAppNamespaceFromRequest();
             $treeKey      = $this->treeKeyFromRequest();
+            // Ensure DESCRIPTION is requested so V3 returns description when possible
             $fields       = $this->exportFieldsV3FromRequest() ?: $this->defaultExportFieldsV3;
+            if (!in_array('DESCRIPTION', $fields, true)) $fields[] = 'DESCRIPTION';
 
             // 1) Try QUERY (with fields)
             $result = $this->queryCategoriesV3All($accessToken, $fields, $appNamespace, $treeKey, true);
 
-            // 2) If QUERY failed or returned no categories, try SEARCH (with fields)
+            // 2) Fallbacks
             if (($result['failed'] ?? false) || empty($result['categories'])) {
-                WixHelper::log('Export Product Categories', 'V3 QUERY failed or empty; falling back to SEARCH (with fields).', 'warn');
+                WixHelper::log('Export Product Categories', 'V3 QUERY failed/empty; falling back to SEARCH (with fields).', 'warn');
                 $result = $this->searchCategoriesV3All($accessToken, $fields, $appNamespace, $treeKey, true);
             }
-
-            // 3) If still failed or empty, try QUERY again but WITHOUT fields
             if ((($result['failed'] ?? false) || empty($result['categories'])) && !empty($fields)) {
-                WixHelper::log('Export Product Categories', 'SEARCH failed or empty; retrying QUERY without fields.', 'warn');
+                WixHelper::log('Export Product Categories', 'SEARCH failed/empty; retrying QUERY without fields.', 'warn');
                 $result = $this->queryCategoriesV3All($accessToken, [], $appNamespace, $treeKey, true);
             }
-
-            // 4) Final guard
             if (!isset($result['categories']) || !is_array($result['categories'])) {
                 WixHelper::log('Export Product Categories', 'V3 API error after fallbacks.', 'error');
                 return response()->json(['error' => 'Failed to fetch categories from Wix (V3).'], 500);
             }
 
+            $categories = $result['categories'];
+
+            // 3) Enrich missing descriptions with GET /categories/{id}
+            foreach ($categories as &$cat) {
+                // if description is absent or empty, try detail fetch
+                if ((!array_key_exists('description', $cat) || trim((string)$cat['description']) === '') && !empty($cat['id'])) {
+                    $detail = $this->getCategoryByIdV3($accessToken, $cat['id'], $appNamespace, $treeKey);
+                    $full   = $detail['category'] ?? [];
+                    if (!empty($full['description'])) {
+                        $cat['description'] = $full['description'];
+                    }
+                    // keep other fields as-is
+                }
+            }
+            unset($cat);
+
             // Oldest-first if dateCreated present
-            usort($result['categories'], function ($a, $b) {
+            usort($categories, function ($a, $b) {
                 $da = (int)($a['dateCreated'] ?? PHP_INT_MAX);
                 $db = (int)($b['dateCreated'] ?? PHP_INT_MAX);
                 return $da <=> $db;
@@ -305,7 +555,7 @@ class WixCategoryController extends Controller
 
             // Append-only pending rows
             $saved = 0;
-            foreach ($result['categories'] as $cat) {
+            foreach ($categories as $cat) {
                 $srcId = $cat['id'] ?? null;
                 if (!$srcId) continue;
 
@@ -324,7 +574,7 @@ class WixCategoryController extends Controller
             }
             WixHelper::log('Export Product Categories', "Saved {$saved} pending row(s) (V3).", 'success');
 
-            return response()->streamDownload(function () use ($result, $fromStoreId, $appNamespace, $treeKey) {
+            return response()->streamDownload(function () use ($categories, $fromStoreId, $appNamespace, $treeKey) {
                 echo json_encode([
                     'meta' => [
                         'from_store_id'   => $fromStoreId,
@@ -332,27 +582,43 @@ class WixCategoryController extends Controller
                         'catalog_version' => 'V3',
                         'generated_at'    => now()->toIso8601String(),
                     ],
-                    'categories' => $result['categories'],
+                    'categories' => $categories,
                 ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
             }, 'categories.json', ['Content-Type' => 'application/json']);
 
         } else {
             // -------- V1
-            $collections = $this->getCollectionsFromWixV1($accessToken);
-            if (!isset($collections['collections']) || !is_array($collections['collections'])) {
+            // Use stores/v1 (not reader) to align with your curls and better field coverage
+            $collectionsResp = $this->getCollectionsFromWixV1($accessToken);
+            if (!isset($collectionsResp['collections']) || !is_array($collectionsResp['collections'])) {
                 WixHelper::log('Export Product Categories', 'API error fetching V1 collections.', 'error');
                 return response()->json(['error' => 'Failed to fetch collections from Wix (V1).'], 500);
             }
 
+            $collections = $collectionsResp['collections'];
+
+            // Enrich each with GET /stores/v1/collections/{id}?includeNumberOfProducts=true if description is missing
+            foreach ($collections as &$col) {
+                if ((!array_key_exists('description', $col) || trim((string)$col['description']) === '') && !empty($col['id'])) {
+                    $detail = $this->getCollectionByIdV1($accessToken, $col['id'], true);
+                    $full   = $detail['collection'] ?? [];
+                    if (!empty($full['description'])) {
+                        $col['description'] = $full['description'];
+                    }
+                }
+            }
+            unset($col);
+
             // Oldest-first if dateCreated present
-            usort($collections['collections'], function ($a, $b) {
+            usort($collections, function ($a, $b) {
                 $da = (int)($a['dateCreated'] ?? PHP_INT_MAX);
                 $db = (int)($b['dateCreated'] ?? PHP_INT_MAX);
                 return $da <=> $db;
             });
 
+            // Append pending rows
             $saved = 0;
-            foreach ($collections['collections'] as $col) {
+            foreach ($collections as $col) {
                 $srcId = $col['id'] ?? null;
                 if (!$srcId) continue;
 
@@ -378,373 +644,388 @@ class WixCategoryController extends Controller
                         'catalog_version' => 'V1',
                         'generated_at'    => now()->toIso8601String(),
                     ],
-                    'collections' => $collections['collections'],
+                    'collections' => $collections,
                 ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
             }, 'collections.json', ['Content-Type' => 'application/json']);
         }
     }
 
+
     // =========================================================
     // Import (auto-detect V1 vs V3 for TARGET) — claim/resolve pattern
     // =========================================================
     public function import(Request $request, WixStore $store)
-    {
-        $userId    = Auth::id() ?: 1;
-        $toStoreId = $store->instance_id;
+{
+    $userId    = Auth::id() ?: 1;
+    $toStoreId = $store->instance_id;
 
-        WixHelper::log('Import Product Categories', "Start: {$store->store_name} ({$toStoreId})", 'info');
+    WixHelper::log('Import Product Categories', "Start: {$store->store_name} ({$toStoreId})", 'info');
 
-        $accessToken = WixHelper::getAccessToken($toStoreId);
-        if (!$accessToken) {
-            WixHelper::log('Import Product Categories', "Unauthorized: Could not get access token for instanceId: {$toStoreId}.", 'error');
-            return back()->with('error', 'Could not get Wix access token.');
-        }
+    $accessToken = WixHelper::getAccessToken($toStoreId);
+    if (!$accessToken) {
+        WixHelper::log('Import Product Categories', "Unauthorized: Could not get access token for instanceId: {$toStoreId}.", 'error');
+        return back()->with('error', 'Could not get Wix access token.');
+    }
 
-        if (!$request->hasFile('categories_json')) {
-            WixHelper::log('Import Product Categories', "No file uploaded for store: {$store->store_name}.", 'error');
-            return back()->with('error', 'No file uploaded.');
-        }
+    if (!$request->hasFile('categories_json')) {
+        WixHelper::log('Import Product Categories', "No file uploaded for store: {$store->store_name}.", 'error');
+        return back()->with('error', 'No file uploaded.');
+    }
 
-        $json    = file_get_contents($request->file('categories_json')->getRealPath());
-        $decoded = json_decode($json, true);
-        if (!is_array($decoded)) {
-            WixHelper::log('Import Product Categories', 'Invalid JSON uploaded.', 'error');
-            return back()->with('error', 'Invalid JSON file.');
-        }
+    $json    = file_get_contents($request->file('categories_json')->getRealPath());
+    $decoded = json_decode($json, true);
+    if (!is_array($decoded)) {
+        WixHelper::log('Import Product Categories', 'Invalid JSON uploaded.', 'error');
+        return back()->with('error', 'Invalid JSON file.');
+    }
 
-        $gotKeys = implode(',', array_keys($decoded));
-        WixHelper::log('Import Product Categories', "Uploaded JSON top-level keys: {$gotKeys}.", 'debug');
+    $catalogVersion = WixHelper::getCatalogVersion($accessToken);
+    $isV3 = $this->isCatalogV3($catalogVersion);
 
-        $catalogVersion = WixHelper::getCatalogVersion($accessToken);
-        $isV3 = $this->isCatalogV3($catalogVersion);
+    // Resolve from_store_id (request > meta > legacy)
+    $explicitFromStoreId = $request->input('from_store_id')
+        ?: ($decoded['meta']['from_store_id'] ?? ($decoded['from_store_id'] ?? null));
 
-        // --- Resolve from_store_id (request > meta > legacy)
-        $explicitFromStoreId = $request->input('from_store_id')
-            ?: ($decoded['meta']['from_store_id'] ?? ($decoded['from_store_id'] ?? null));
+    // ---- small helpers ----
+    $appNamespace = $this->treeAppNamespaceFromRequest();
+    $treeKey      = $this->treeKeyFromRequest();
 
-        // Robust created-at resolver
-        $createdAtMillis = function (array $item): int {
-            foreach (['createdDate','dateCreated','createdAt','creationDate','date_created'] as $k) {
-                if (array_key_exists($k, $item)) {
-                    $v = $item[$k];
-                    if (is_numeric($v)) return (int)$v;
-                    if (is_string($v)) {
-                        $ts = strtotime($v);
-                        if ($ts !== false) return $ts * 1000;
-                    }
+    $buildSeoFromDesc = function (?string $desc): ?array {
+        $desc = trim(preg_replace('/\s+/u', ' ', strip_tags((string)$desc)));
+        if ($desc === '') return null;
+        $desc = mb_substr($desc, 0, 300, 'UTF-8');
+        return [
+            'tags' => [[
+                'type'  => 'meta',
+                'props' => [
+                    'fields' => [
+                        'name'    => ['stringValue' => 'description'],
+                        'content' => ['stringValue' => $desc],
+                    ]
+                ],
+            ]]
+        ];
+    };
+    $ensureSeoOnPayload = function (array &$payload, array $source) use ($buildSeoFromDesc) {
+        $hasMeta = false;
+        if (isset($payload['seoData']['tags']) && is_array($payload['seoData']['tags'])) {
+            foreach ($payload['seoData']['tags'] as $t) {
+                if (($t['type'] ?? '') === 'meta'
+                    && strtolower($t['props']['fields']['name']['stringValue'] ?? '') === 'description') {
+                    $hasMeta = true; break;
                 }
             }
-            foreach ([['audit','createdDate'], ['audit','dateCreated'], ['metadata','createdDate'], ['metadata','dateCreated']] as $path) {
-                $v = $this->getNested($item, $path);
-                if ($v !== null) {
-                    if (is_numeric($v)) return (int)$v;
-                    if (is_string($v)) {
-                        $ts = strtotime($v);
-                        if ($ts !== false) return $ts * 1000;
-                    }
-                }
-            }
-            return PHP_INT_MAX;
-        };
-
-        // Helpers for locking/dedupe (coupon-style)
-        $claimPendingRow = function (?string $sourceId) use ($userId, $explicitFromStoreId) {
-            return DB::transaction(function () use ($userId, $explicitFromStoreId, $sourceId) {
-                $row = null;
-                if ($sourceId) {
-                    $row = WixCollectionMigration::where('user_id', $userId)
-                        ->where('from_store_id', $explicitFromStoreId)
-                        ->where('status', 'pending')
-                        ->where(function ($q) use ($sourceId) {
-                            $q->where('source_collection_id', $sourceId)
-                            ->orWhereNull('source_collection_id');
-                        })
-                        ->orderByRaw("CASE WHEN source_collection_id = ? THEN 0 ELSE 1 END", [$sourceId])
-                        ->orderBy('created_at', 'asc')
-                        ->lockForUpdate()
-                        ->first();
-                }
-                if (!$row) {
-                    $row = WixCollectionMigration::where('user_id', $userId)
-                        ->where('from_store_id', $explicitFromStoreId)
-                        ->where('status', 'pending')
-                        ->orderBy('created_at', 'asc')
-                        ->lockForUpdate()
-                        ->first();
-                }
-                return $row;
-            }, 3);
-        };
-
-        $resolveTargetRow = function ($claimed, ?string $sourceId) use ($userId, $explicitFromStoreId, $toStoreId) {
-            if ($sourceId) {
-                $existing = WixCollectionMigration::where('user_id', $userId)
-                    ->where('from_store_id', $explicitFromStoreId)
-                    ->where('to_store_id', $toStoreId)
-                    ->where('source_collection_id', $sourceId)
-                    ->orderBy('created_at', 'asc')
-                    ->first();
-
-                if ($existing) {
-                    if ($claimed && $claimed->id !== $existing->id && $claimed->status === 'pending') {
-                        $claimed->update([
-                            'status'        => 'skipped',
-                            'error_message' => 'Merged into existing migration row id '.$existing->id,
-                        ]);
-                    }
-                    return $existing;
-                }
-            }
-            return $claimed;
-        };
-
-        if ($isV3) {
-            // -------- V3 IMPORT
-            $normalized = $this->normalizeUploadedCategories($decoded);
-            if ($normalized === null) {
-                WixHelper::log(
-                    'Import Product Categories',
-                    'Invalid JSON structure. Expected: {meta.from_store_id,categories[]} or {from_store_id,collections[]}.',
-                    'error'
-                );
-                return back()->with('error',
-                    'Invalid JSON. Provide V3 export (meta.from_store_id + categories[]) or V1 export (from_store_id + collections[]).'
-                );
-            }
-
-            // If missing explicitFromStoreId, take from normalized tuple
-            if (!$explicitFromStoreId) {
-                $explicitFromStoreId = $normalized[0];
-            }
-
-            [$fromStoreId, $categories] = $normalized;
-
-            // Oldest-first
-            usort($categories, function ($a, $b) use ($createdAtMillis) {
-                return $createdAtMillis($a) <=> $createdAtMillis($b);
-            });
-
-            $appNamespace = $this->treeAppNamespaceFromRequest();
-            $treeKey      = $this->treeKeyFromRequest();
-
-            $imported = 0;
-            $failed   = 0;
-
-            // existing slugs cache to avoid collisions
-            $existingSlugs = $this->getExistingSlugsV3($accessToken, $appNamespace, $treeKey);
-
-            foreach ($categories as $category) {
-                $sourceId = $category['id'] ?? null;
-                $name     = $category['name'] ?? null;
-                if (!$sourceId) continue;
-
-                // Skip system/built-in
-                if ($this->shouldSkipSystemCategory($category)) {
-                    // Update claimed row as skipped
-                    $claimed = $claimPendingRow($sourceId);
-                    $targetRow = $resolveTargetRow($claimed, $sourceId);
-                    if ($targetRow) {
-                        DB::transaction(function () use ($targetRow, $toStoreId, $category) {
-                            $targetRow->update([
-                                'to_store_id'                 => $toStoreId,
-                                'destination_collection_id'   => null,
-                                'status'                      => 'skipped',
-                                'error_message'               => null,
-                                'source_collection_name'      => $category['name'] ?? $targetRow->source_collection_name,
-                                'source_collection_slug'      => $targetRow->source_collection_slug ?? ($category['slug'] ?? null),
-                                'source_collection_id'        => $targetRow->source_collection_id ?: ($category['id'] ?? null),
-                            ]);
-                        }, 3);
-                    }
-                    WixHelper::log('Import Product Categories', "Skipped system category '{$name}'.", 'info');
-                    continue;
-                }
-
-                // Prepare payload
-                $payloadCategory = $this->sanitizeCategoryForCreateV3($category);
-                $baseForSlug = $payloadCategory['slug'] ?? ($category['slug'] ?? $name ?? 'category');
-                $payloadCategory['slug'] = $this->makeUniqueSlug($baseForSlug, $existingSlugs);
-
-                // Create (handle duplicate slug retry inside)
-                $result = $this->createCategoryWithDedupeV3(
-                    $accessToken,
-                    $payloadCategory,
-                    $appNamespace,
-                    $treeKey,
-                    $existingSlugs
-                );
-
-                // Claim & resolve now
-                $claimed   = $claimPendingRow($sourceId);
-                $targetRow = $resolveTargetRow($claimed, $sourceId);
-
-                if (isset($result['category']['id'])) {
-                    $newId = $result['category']['id'];
-                    if ($targetRow) {
-                        DB::transaction(function () use ($targetRow, $toStoreId, $newId, $category) {
-                            $targetRow->update([
-                                'to_store_id'                 => $toStoreId,
-                                'destination_collection_id'   => $newId,
-                                'status'                      => 'success',
-                                'error_message'               => null,
-                                'source_collection_name'      => $category['name'] ?? $targetRow->source_collection_name,
-                                'source_collection_slug'      => $targetRow->source_collection_slug ?? ($category['slug'] ?? null),
-                                'source_collection_id'        => $targetRow->source_collection_id ?: ($category['id'] ?? null),
-                            ]);
-                        }, 3);
-                    }
-                    $imported++;
-                    WixHelper::log('Import Product Categories', "Imported category '{$payloadCategory['name']}' (new ID: {$newId}).", 'success');
-                } else {
-                    $err = json_encode(['sent' => ['category' => $payloadCategory, 'treeReference' => $this->treeRefArray($appNamespace, $treeKey)], 'response' => $result]);
-                    if ($targetRow) {
-                        DB::transaction(function () use ($targetRow, $toStoreId, $category, $err) {
-                            $targetRow->update([
-                                'to_store_id'                 => $toStoreId,
-                                'destination_collection_id'   => null,
-                                'status'                      => 'failed',
-                                'error_message'               => $err,
-                                'source_collection_name'      => $category['name'] ?? $targetRow->source_collection_name,
-                                'source_collection_slug'      => $targetRow->source_collection_slug ?? ($category['slug'] ?? null),
-                                'source_collection_id'        => $targetRow->source_collection_id ?: ($category['id'] ?? null),
-                            ]);
-                        }, 3);
-                    }
-                    $failed++;
-                    WixHelper::log('Import Product Categories', "Failed to import '{$name}'.", 'error');
-                }
-            }
-
-            if ($imported > 0) {
-                $msg = "{$imported} category(s) imported. Failed: {$failed}";
-                WixHelper::log('Import Product Categories', "Done. {$msg}", $failed ? 'warn' : 'success');
-                return back()->with('success', $msg);
-            }
-            if ($failed > 0) {
-                $msg = "No categories imported. Failed: {$failed}";
-                WixHelper::log('Import Product Categories', "Done. {$msg}", 'error');
-                return back()->with('error', $msg);
-            }
-            WixHelper::log('Import Product Categories', 'Done. Nothing to import.', 'info');
-            return back()->with('success', 'Nothing to import.');
         }
-
-        // -------- V1 IMPORT
-        if (!isset($decoded['collections']) || !is_array($decoded['collections'])) {
-            WixHelper::log('Import Product Categories', 'Invalid JSON structure for V1 import. Expected key: collections[].', 'error');
-            return back()->with('error', 'Invalid JSON structure. Required key: collections[].');
+        if (!$hasMeta) {
+            $seo = $buildSeoFromDesc($payload['description'] ?? ($source['description'] ?? null));
+            if ($seo) $payload['seoData'] = $seo;
         }
+    };
 
-        // If missing explicitFromStoreId, try legacy
-        if (!$explicitFromStoreId) {
-            $explicitFromStoreId = $decoded['from_store_id'] ?? null;
+    $getV3Detail = function (string $id) use ($accessToken, $appNamespace, $treeKey) {
+        return $this->getCategoryByIdV3($accessToken, $id, $appNamespace, $treeKey);
+    };
+    $patchV3 = function (string $id, array $partial) use ($accessToken, $appNamespace, $treeKey, $getV3Detail) {
+        $detail = $getV3Detail($id);
+        $rev = $detail['category']['revision'] ?? null;
+        if ($rev === null) return ['error' => 'Missing revision'];
+        $body = [
+            'category'      => array_merge(['revision' => (string)$rev], $partial),
+            'treeReference' => $this->treeRefArray($appNamespace, $treeKey),
+        ];
+        $resp = Http::withHeaders([
+            'Authorization' => $this->ensureBearer($accessToken),
+            'Content-Type'  => 'application/json'
+        ])->patch("https://www.wixapis.com/categories/v1/categories/{$id}", $body);
+        return $resp->json() ?: [];
+    };
+    $patchV1 = function (string $id, array $partial) use ($accessToken) {
+        $resp = Http::withHeaders([
+            'Authorization' => $this->ensureBearer($accessToken),
+            'Content-Type'  => 'application/json'
+        ])->patch("https://www.wixapis.com/stores/v1/collections/{$id}", ['collection' => $partial]);
+        return $resp->json() ?: [];
+    };
+    $v1Get = function (string $id) use ($accessToken) {
+        return $this->getCollectionByIdV1($accessToken, $id, false);
+    };
+
+    // Sorter
+    $createdAtMillis = function (array $item): int {
+        foreach (['createdDate','dateCreated','createdAt','creationDate','date_created'] as $k) {
+            if (array_key_exists($k, $item)) {
+                $v = $item[$k];
+                if (is_numeric($v)) return (int)$v;
+                if (is_string($v)) { $ts = strtotime($v); if ($ts !== false) return $ts * 1000; }
+            }
         }
-        if (!$explicitFromStoreId) {
-            WixHelper::log('Import Product Categories', 'Missing from_store_id (input or JSON).', 'error');
-            return back()->with('error', 'from_store_id is required. Provide it as a field or include meta.from_store_id / from_store_id in the JSON.');
+        foreach ([['audit','createdDate'], ['audit','dateCreated'], ['metadata','createdDate'], ['metadata','dateCreated']] as $p) {
+            $cur = $this->getNested($item, $p);
+            if ($cur !== null) {
+                if (is_numeric($cur)) return (int)$cur;
+                if (is_string($cur))  { $ts = strtotime($cur); if ($ts !== false) return $ts * 1000; }
+            }
         }
+        return PHP_INT_MAX;
+    };
 
-        $collections = $decoded['collections'];
+    if ($isV3) {
+        $normalized = $this->normalizeUploadedCategories($decoded);
+        if ($normalized === null) {
+            WixHelper::log('Import Product Categories', 'Invalid JSON for V3 import.', 'error');
+            return back()->with('error', 'Invalid JSON. Provide V3 export (meta.from_store_id + categories[]) or V1 export (from_store_id + collections[]).');
+        }
+        if (!$explicitFromStoreId) $explicitFromStoreId = $normalized[0];
+        [$fromStoreId, $categories] = $normalized;
 
-        // Oldest-first
-        usort($collections, function ($a, $b) use ($createdAtMillis) {
-            return $createdAtMillis($a) <=> $createdAtMillis($b);
-        });
+        usort($categories, fn($a,$b) => $createdAtMillis($a) <=> $createdAtMillis($b));
 
-        $imported = 0;
-        $failed   = 0;
+        // Build target indexes
+        $scan = $this->queryCategoriesV3All($accessToken, ['DESCRIPTION','SEO_DATA'], $appNamespace, $treeKey, true);
+        if (empty($scan['categories'])) {
+            $scan = $this->searchCategoriesV3All($accessToken, ['DESCRIPTION','SEO_DATA'], $appNamespace, $treeKey, true);
+        }
+        $bySlug = []; $byName = [];
+        foreach (($scan['categories'] ?? []) as $c) {
+            if (!empty($c['slug'])) $bySlug[strtolower($c['slug'])] = $c;
+            if (!empty($c['name'])) $byName[strtolower($c['name'])] = $c;
+        }
+        $existingSlugs = $this->getExistingSlugsV3($accessToken, $appNamespace, $treeKey);
+        $allProductsIdV3 = $this->getAllProductsCategoryIdV3($accessToken);
 
-        foreach ($collections as $collection) {
-            $sourceId = $collection['id'] ?? null;
-            $name     = $collection['name'] ?? null;
+        $created = 0; $updated = 0; $recreated = 0; $failed = 0;
+
+        foreach ($categories as $cat) {
+            $sourceId = $cat['id'] ?? null;
             if (!$sourceId) continue;
 
-            // Skip system/built-in
-            if ($this->shouldSkipSystemCategory($collection)) {
-                $claimed = $claimPendingRow($sourceId);
-                $targetRow = $resolveTargetRow($claimed, $sourceId);
-                if ($targetRow) {
-                    DB::transaction(function () use ($targetRow, $toStoreId, $collection) {
-                        $targetRow->update([
-                            'to_store_id'                 => $toStoreId,
-                            'destination_collection_id'   => null,
-                            'status'                      => 'skipped',
-                            'error_message'               => null,
-                            'source_collection_name'      => $collection['name'] ?? $targetRow->source_collection_name,
-                            'source_collection_slug'      => $targetRow->source_collection_slug ?? ($collection['slug'] ?? null),
-                            'source_collection_id'        => $targetRow->source_collection_id ?: ($collection['id'] ?? null),
-                        ]);
-                    }, 3);
+            // Get or create DB row for this mapping
+            $row = WixCollectionMigration::firstOrCreate(
+                [
+                    'user_id'              => $userId,
+                    'from_store_id'        => $explicitFromStoreId,
+                    'to_store_id'          => $toStoreId,
+                    'source_collection_id' => $sourceId,
+                ],
+                [
+                    'source_collection_slug'    => $cat['slug'] ?? null,
+                    'source_collection_name'    => $cat['name'] ?? null,
+                    'destination_collection_id' => null,
+                    'status'                    => 'pending',
+                    'error_message'             => null,
+                ]
+            );
+
+            // Special: All Products -> update
+            if ($this->shouldSkipSystemCategory($cat) && $allProductsIdV3) {
+                $patch = $this->sanitizeCategoryForCreateV3($cat);
+                unset($patch['slug']);
+                $ensureSeoOnPayload($patch, $cat);
+
+                $res = $patchV3($allProductsIdV3, $patch);
+                if (isset($res['category']['id'])) {
+                    $row->update([
+                        'destination_collection_id' => $allProductsIdV3,
+                        'status'                    => 'success',
+                        'error_message'             => null,
+                    ]);
+                    $updated++;
+                } else {
+                    $row->update(['status'=>'failed','error_message'=>json_encode(['patch'=>$patch,'response'=>$res])]);
+                    $failed++;
                 }
-                WixHelper::log('Import Product Categories', "Skipped system collection '{$name}'.", 'info');
                 continue;
             }
+            if ($this->shouldSkipSystemCategory($cat)) continue;
 
-            // Prepare payload (remove system fields)
-            $payload = $collection;
-            unset($payload['id'], $payload['numberOfProducts']);
+            $payload = $this->sanitizeCategoryForCreateV3($cat);
+            $ensureSeoOnPayload($payload, $cat);
 
-            // Create
-            $result = $this->createCollectionInWixV1($accessToken, [
-                'name'        => $payload['name'] ?? '',
-                'description' => $payload['description'] ?? null,
-                'visible'     => $payload['visible'] ?? true
-            ]);
+            // Prefer DB destination id if present
+            $targetId = $row->destination_collection_id ?: null;
+            $exists   = false;
+            if ($targetId) {
+                $detail = $getV3Detail($targetId);
+                $exists = !empty($detail['category']['id']);
+            }
 
-            // Claim & resolve
-            $claimed   = $claimPendingRow($sourceId);
-            $targetRow = $resolveTargetRow($claimed, $sourceId);
-
-            if (isset($result['collection']['id'])) {
-                $newId = $result['collection']['id'];
-                if ($targetRow) {
-                    DB::transaction(function () use ($targetRow, $toStoreId, $newId, $collection) {
-                        $targetRow->update([
-                            'to_store_id'                 => $toStoreId,
-                            'destination_collection_id'   => $newId,
-                            'status'                      => 'success',
-                            'error_message'               => null,
-                            'source_collection_name'      => $collection['name'] ?? $targetRow->source_collection_name,
-                            'source_collection_slug'      => $targetRow->source_collection_slug ?? ($collection['slug'] ?? null),
-                            'source_collection_id'        => $targetRow->source_collection_id ?: ($collection['id'] ?? null),
-                        ]);
-                    }, 3);
+            if ($exists) {
+                $patch = $payload; unset($patch['slug']);
+                $res = $patchV3($targetId, $patch);
+                if (isset($res['category']['id'])) {
+                    $row->update(['status'=>'success','error_message'=>null]);
+                    $updated++;
+                } else {
+                    $row->update(['status'=>'failed','error_message'=>json_encode(['patch'=>$patch,'response'=>$res])]);
+                    $failed++;
                 }
-                $imported++;
-                WixHelper::log('Import Product Categories', "Imported collection '{$payload['name']}' (new ID: {$newId}).", 'success');
             } else {
-                $err = json_encode(['sent' => $payload, 'response' => $result]);
-                if ($targetRow) {
-                    DB::transaction(function () use ($targetRow, $toStoreId, $collection, $err) {
-                        $targetRow->update([
-                            'to_store_id'                 => $toStoreId,
-                            'destination_collection_id'   => null,
-                            'status'                      => 'failed',
-                            'error_message'               => $err,
-                            'source_collection_name'      => $collection['name'] ?? $targetRow->source_collection_name,
-                            'source_collection_slug'      => $targetRow->source_collection_slug ?? ($collection['slug'] ?? null),
-                            'source_collection_id'        => $targetRow->source_collection_id ?: ($collection['id'] ?? null),
+                // Try to match by slug/name before creating
+                $match = null;
+                if (!empty($cat['slug'])) $match = $bySlug[strtolower($cat['slug'])] ?? null;
+                if (!$match && !empty($cat['name'])) $match = $byName[strtolower($cat['name'])] ?? null;
+
+                if ($match && !empty($match['id'])) {
+                    $patch = $payload; unset($patch['slug']);
+                    $res = $patchV3($match['id'], $patch);
+                    if (isset($res['category']['id'])) {
+                        $row->update([
+                            'destination_collection_id' => $match['id'],
+                            'status' => 'success',
+                            'error_message' => null,
                         ]);
-                    }, 3);
+                        $updated++;
+                    } else {
+                        $row->update(['status'=>'failed','error_message'=>json_encode(['patch'=>$patch,'response'=>$res])]);
+                        $failed++;
+                    }
+                } else {
+                    // CREATE / RE-CREATE
+                    $baseForSlug = $payload['slug'] ?? ($cat['slug'] ?? $payload['name'] ?? 'category');
+                    $payload['slug'] = $this->makeUniqueSlug($baseForSlug, $existingSlugs);
+                    $res = $this->createCategoryWithDedupeV3($accessToken, $payload, $appNamespace, $treeKey, $existingSlugs);
+                    if (isset($res['category']['id'])) {
+                        $row->update([
+                            'destination_collection_id' => $res['category']['id'],
+                            'status'                    => 'success',
+                            'error_message'             => null,
+                        ]);
+                        $recreated += ($targetId ? 1 : 0);
+                        $created   += ($targetId ? 0 : 1);
+                    } else {
+                        $row->update(['status'=>'failed','error_message'=>json_encode(['sent'=>$payload,'response'=>$res])]);
+                        $failed++;
+                    }
                 }
-                $failed++;
-                WixHelper::log('Import Product Categories', "Failed to import '{$name}'.", 'error');
             }
         }
 
-        if ($imported > 0) {
-            $msg = "{$imported} collection(s) imported. Failed: {$failed}";
-            WixHelper::log('Import Product Categories', "Done. {$msg}", $failed ? 'warn' : 'success');
-            return back()->with('success', $msg);
-        }
-        if ($failed > 0) {
-            $msg = "No collections imported. Failed: {$failed}";
-            WixHelper::log('Import Product Categories', "Done. {$msg}", 'error');
-            return back()->with('error', $msg);
-        }
-        WixHelper::log('Import Product Categories', 'Done. Nothing to import.', 'info');
-        return back()->with('success', 'Nothing to import.');
+        $msg = "V3 import: created={$created}, updated={$updated}, recreated={$recreated}, failed={$failed}";
+        WixHelper::log('Import Product Categories', "Done. {$msg}", $failed ? 'warn' : 'success');
+        return $failed && !$created && !$updated && !$recreated
+            ? back()->with('error', $msg)
+            : ($failed ? back()->with('warning', $msg) : back()->with('success', $msg));
     }
+
+    // ---------- V1 target (upsert + recreate) ----------
+    if (!isset($decoded['collections']) || !is_array($decoded['collections'])) {
+        WixHelper::log('Import Product Categories', 'Invalid JSON structure for V1 import. Expected key: collections[].', 'error');
+        return back()->with('error', 'Invalid JSON structure. Required key: collections[].');
+    }
+    if (!$explicitFromStoreId) {
+        $explicitFromStoreId = $decoded['from_store_id'] ?? null;
+        if (!$explicitFromStoreId) {
+            return back()->with('error', 'from_store_id is required. Provide it as a field or include meta.from_store_id / from_store_id in the JSON.');
+        }
+    }
+
+    $collections = $decoded['collections'];
+    usort($collections, fn($a,$b) => $createdAtMillis($a) <=> $createdAtMillis($b));
+
+    $scan = $this->getCollectionsFromWixV1($accessToken);
+    $bySlug = []; $byName = [];
+    foreach (($scan['collections'] ?? []) as $c) {
+        if (!empty($c['slug'])) $bySlug[strtolower($c['slug'])] = $c;
+        if (!empty($c['name'])) $byName[strtolower($c['name'])] = $c;
+    }
+
+    $created = 0; $updated = 0; $recreated = 0; $failed = 0;
+
+    foreach ($collections as $col) {
+        $sourceId = $col['id'] ?? null;
+        if (!$sourceId) continue;
+
+        $row = WixCollectionMigration::firstOrCreate(
+            [
+                'user_id'              => $userId,
+                'from_store_id'        => $explicitFromStoreId,
+                'to_store_id'          => $toStoreId,
+                'source_collection_id' => $sourceId,
+            ],
+            [
+                'source_collection_slug'    => $col['slug'] ?? null,
+                'source_collection_name'    => $col['name'] ?? null,
+                'destination_collection_id' => null,
+                'status'                    => 'pending',
+                'error_message'             => null,
+            ]
+        );
+
+        $targetId = $row->destination_collection_id ?: null;
+        $exists   = false;
+        if ($targetId) {
+            $detail = $v1Get($targetId);
+            $exists = !empty($detail['collection']['id']);
+        }
+
+        if ($exists) {
+            $patch = [
+                'name'        => $col['name'] ?? $detail['collection']['name'] ?? '',
+                'description' => $col['description'] ?? ($detail['collection']['description'] ?? null),
+                'visible'     => array_key_exists('visible',$col) ? (bool)$col['visible'] : ($detail['collection']['visible'] ?? true),
+            ];
+            $res = $patchV1($targetId, $patch);
+            if (isset($res['collection']['id'])) {
+                $row->update(['status'=>'success','error_message'=>null]);
+                $updated++;
+            } else {
+                $row->update(['status'=>'failed','error_message'=>json_encode(['patch'=>$patch,'response'=>$res])]);
+                $failed++;
+            }
+        } else {
+            // Try match by slug/name
+            $match = null;
+            if (!empty($col['slug'])) $match = $bySlug[strtolower($col['slug'])] ?? null;
+            if (!$match && !empty($col['name'])) $match = $byName[strtolower($col['name'])] ?? null;
+
+            if ($match && !empty($match['id'])) {
+                $patch = [
+                    'name'        => $col['name'] ?? $match['name'] ?? '',
+                    'description' => $col['description'] ?? ($match['description'] ?? null),
+                    'visible'     => array_key_exists('visible',$col) ? (bool)$col['visible'] : ($match['visible'] ?? true),
+                ];
+                $res = $patchV1($match['id'], $patch);
+                if (isset($res['collection']['id'])) {
+                    $row->update([
+                        'destination_collection_id' => $match['id'],
+                        'status'                    => 'success',
+                        'error_message'             => null,
+                    ]);
+                    $updated++;
+                } else {
+                    $row->update(['status'=>'failed','error_message'=>json_encode(['patch'=>$patch,'response'=>$res])]);
+                    $failed++;
+                }
+            } else {
+                // CREATE / RE-CREATE
+                $res = $this->createCollectionInWixV1($accessToken, [
+                    'name'        => $col['name'] ?? '',
+                    'description' => $col['description'] ?? null,
+                    'visible'     => array_key_exists('visible',$col) ? (bool)$col['visible'] : true,
+                ]);
+                if (isset($res['collection']['id'])) {
+                    $row->update([
+                        'destination_collection_id' => $res['collection']['id'],
+                        'status'                    => 'success',
+                        'error_message'             => null,
+                    ]);
+                    $recreated += ($targetId ? 1 : 0);
+                    $created   += ($targetId ? 0 : 1);
+                } else {
+                    $row->update(['status'=>'failed','error_message'=>json_encode(['sent'=>$col,'response'=>$res])]);
+                    $failed++;
+                }
+            }
+        }
+    }
+
+    $msg = "V1 import: created={$created}, updated={$updated}, recreated={$recreated}, failed={$failed}";
+    WixHelper::log('Import Product Categories', "Done. {$msg}", $failed ? 'warn' : 'success');
+    return $failed && !$created && !$updated && !$recreated
+        ? back()->with('error', $msg)
+        : ($failed ? back()->with('warning', $msg) : back()->with('success', $msg));
+}
+
 
 
     // =========================================================
@@ -908,6 +1189,25 @@ class WixCategoryController extends Controller
         return ['categories' => $all, 'pages' => $pages];
     }
 
+    protected function getCategoryByIdV3(string $accessToken, string $categoryId, string $appNamespace, ?string $treeKey): array
+    {
+        // Build query string: treeReference.appNamespace and optional treeKey
+        $qs = http_build_query(array_filter([
+            'treeReference.appNamespace' => $appNamespace,
+            'treeReference.treeKey'      => $treeKey,
+        ], fn($v) => $v !== null && $v !== ''));
+
+        $url = "https://www.wixapis.com/categories/v1/categories/{$categoryId}" . ($qs ? "?{$qs}" : '');
+
+        $resp = Http::withHeaders([
+            'Authorization' => $this->ensureBearer($accessToken),
+            'Content-Type'  => 'application/json'
+        ])->get($url);
+
+        return $resp->json() ?: [];
+    }
+
+
 
     protected function createCategoryInWixV3(string $accessToken, array $category, string $appNamespace, ?string $treeKey): array
     {
@@ -957,8 +1257,24 @@ class WixCategoryController extends Controller
             if ($payload['slug'] === '') unset($payload['slug']);
         }
 
+        // NEW: clean + enforce Wix limit (maxLength 600) so it doesn't get dropped
+        if (isset($payload['description'])) {
+            // strip tags, collapse whitespace
+            $desc = trim(preg_replace('/\s+/u', ' ', strip_tags((string)$payload['description'])));
+            if ($desc === '') {
+                unset($payload['description']);
+            } else {
+                // hard cap at 600 chars as per Wix schema
+                if (mb_strlen($desc, 'UTF-8') > 600) {
+                    $desc = mb_substr($desc, 0, 600, 'UTF-8');
+                }
+                $payload['description'] = $desc;
+            }
+        }
+
         return $payload;
     }
+
 
     protected function getAllProductsCategoryIdV3(string $accessToken): ?string
     {
@@ -1053,17 +1369,19 @@ class WixCategoryController extends Controller
     // =========================================================
     protected function getCollectionsFromWixV1(string $accessToken): array
     {
+        // Mirrors: POST https://www.wixapis.com/stores/v1/collections/query
         $body = ['query' => new \stdClass()];
 
         $response = Http::withHeaders([
             'Authorization' => $this->ensureBearer($accessToken),
             'Content-Type'  => 'application/json'
-        ])->post('https://www.wixapis.com/stores-reader/v1/collections/query', $body);
+        ])->post('https://www.wixapis.com/stores/v1/collections/query', $body);
 
         WixHelper::log('Export Product Categories', 'Wix API response received for collections query (V1).', 'debug');
 
-        return $response->json();
+        return $response->json() ?: [];
     }
+
 
     protected function createCollectionInWixV1(string $accessToken, array $collection): array
     {
@@ -1076,6 +1394,24 @@ class WixCategoryController extends Controller
 
         return $response->json();
     }
+
+    /**
+     * Fetch a single V1 collection (full fields incl. description) by ID.
+     */
+    protected function getCollectionByIdV1(string $accessToken, string $collectionId, bool $includeNumberOfProducts = true): array
+    {
+        $qs = $includeNumberOfProducts ? '?includeNumberOfProducts=true' : '';
+        $url = "https://www.wixapis.com/stores/v1/collections/{$collectionId}{$qs}";
+
+        $resp = Http::withHeaders([
+            'Authorization' => $this->ensureBearer($accessToken),
+            'Content-Type'  => 'application/json'
+        ])->get($url);
+
+        return $resp->json() ?: [];
+    }
+
+
 
     // =========================================================
     // Normalization for uploaded files (V3 importer)

@@ -25,7 +25,9 @@ use App\Http\Controllers\WixStoreController;
 use Illuminate\Support\Facades\Route;
 
 Route::get('/', [HomeController::class, 'index']);
-
+Route::get('/php-info', function () {
+    phpinfo();
+});
 // Route::get('/dashboard', function () {
 //     return view('dashboard');
 // })->middleware(['auth', 'verified'])->name('dashboard');

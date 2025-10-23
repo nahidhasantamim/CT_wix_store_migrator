@@ -51,7 +51,7 @@
                 </h2>
                 <div id="accordion-collapse-body-1" class="hidden" aria-labelledby="accordion-collapse-heading-1">
 
-                  {{-- ✅ SCOPE THE AUTO WIZARD --}}
+                  {{-- SCOPE THE AUTO WIZARD --}}
                   <div id="auto-wizard" class="mx-auto p-4 sm:p-6 border border-b-0 border-gray-200 dark:border-gray-700">
                     {{-- Mobile progress (use class, not duplicated ID) --}}
                     <div class="h-1 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden sm:hidden mb-3">
@@ -181,7 +181,7 @@
                 </h2>
                 <div id="accordion-collapse-body-3" class="hidden" aria-labelledby="accordion-collapse-heading-3">
 
-                  {{-- ✅ SCOPE THE MANUAL WIZARD --}}
+                  {{-- SCOPE THE MANUAL WIZARD --}}
                   <div id="manual-wizard" class="mx-auto p-4 sm:p-6 border border-b-0 border-gray-200 dark:border-gray-700">
                     {{-- Mobile progress --}}
                     <div class="h-1 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden sm:hidden mb-3">

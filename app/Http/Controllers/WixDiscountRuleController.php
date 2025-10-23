@@ -721,6 +721,7 @@ class WixDiscountRuleController extends Controller
 
     /**
      * Map an array of Scope objects in-place.
+     * Accepts both source IDs (maps via migrations) and destination IDs (passes through).
      */
     private function mapScopesArray(array &$scopes, string $fromStoreId, string $toStoreId, array &$meta): void
     {
@@ -764,29 +765,70 @@ class WixDiscountRuleController extends Controller
         unset($scope);
     }
 
-    private function lookupDestinationProductId(string $sourceProductId, string $fromStoreId, string $toStoreId): ?string
+    /**
+     * Product ID mapping:
+     * 1) source_product_id  -> destination_product_id
+     * 2) (reverse) if given ID is already a destination_product_id for $toStoreId, accept as-is
+     */
+    private function lookupDestinationProductId(string $productId, string $fromStoreId, string $toStoreId): ?string
     {
+        // Source -> Destination
         $row = WixProductMigration::where('from_store_id', $fromStoreId)
             ->where('to_store_id',   $toStoreId)
-            ->where('source_product_id', $sourceProductId)
+            ->where('source_product_id', $productId)
             ->whereNotNull('destination_product_id')
             ->orderBy('created_at', 'asc')
             ->first();
 
-        return $row?->destination_product_id ? (string)$row->destination_product_id : null;
+        if ($row?->destination_product_id) {
+            return (string)$row->destination_product_id;
+        }
+
+        // Destination (already) -> Destination (pass-through)
+        $rev = WixProductMigration::where('to_store_id', $toStoreId)
+            ->where('destination_product_id', $productId)
+            ->orderBy('created_at', 'asc')
+            ->first();
+
+        if ($rev) {
+            return (string)$productId; // already a valid destination id
+        }
+
+        return null;
     }
 
-    private function lookupDestinationCollectionId(string $sourceCollectionId, string $fromStoreId, string $toStoreId): ?string
+    /**
+     * Collection ID mapping:
+     * 1) source_collection_id -> destination_collection_id
+     * 2) (reverse) if given ID is already a destination_collection_id for $toStoreId, accept as-is
+     */
+    private function lookupDestinationCollectionId(string $collectionId, string $fromStoreId, string $toStoreId): ?string
     {
+        // Source -> Destination
         $row = WixCollectionMigration::where('from_store_id', $fromStoreId)
             ->where('to_store_id',   $toStoreId)
-            ->where('source_collection_id', $sourceCollectionId)
+            ->where('source_collection_id', $collectionId)
             ->whereNotNull('destination_collection_id')
             ->orderBy('created_at', 'asc')
             ->first();
 
-        return $row?->destination_collection_id ? (string)$row->destination_collection_id : null;
+        if ($row?->destination_collection_id) {
+            return (string)$row->destination_collection_id;
+        }
+
+        // Destination (already) -> Destination (pass-through)
+        $rev = WixCollectionMigration::where('to_store_id', $toStoreId)
+            ->where('destination_collection_id', $collectionId)
+            ->orderBy('created_at', 'asc')
+            ->first();
+
+        if ($rev) {
+            return (string)$collectionId; // already a valid destination id
+        }
+
+        return null;
     }
+
 
     private function formatRuleMappingError(array $meta): string
     {
