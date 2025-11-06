@@ -74,6 +74,7 @@
         <script>
             if (document.getElementById("search-table") && typeof simpleDatatables.DataTable !== 'undefined') {
                 const dataTable = new simpleDatatables.DataTable("#search-table", {
+                    paging: false,
                     searchable: true,
                     sortable: false
                 });

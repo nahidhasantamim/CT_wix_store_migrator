@@ -115,7 +115,7 @@
                       </div>
                     </div>
 
-                    {{-- NEW: hard cap limit --}}
+                    {{-- Hard cap limit --}}
                     <div>
                       <label class="block text-xs text-gray-300 mb-1" for="limit_{{ $idx }}_{{ $store->id }}">Max orders (optional)</label>
                       <input type="number" min="1" name="limit" id="limit_{{ $idx }}_{{ $store->id }}"
@@ -234,6 +234,39 @@
                   </div>
                 </form>
               </div>
+
+              @if (($conf['key'] ?? null) === 'contacts')
+                <!-- NEW SYNC BUTTONS -->
+                <div class="grid">
+                  
+
+                  <!-- Destination Store Sync -->
+                  <form action="{{ route('wix.contacts.syncDestination', $store) }}" method="POST">
+                    @csrf
+                    <button type="submit"
+                            class="w-full inline-flex items-center justify-center text-gray-900 bg-white border border-gray-300 focus:outline-none hover:bg-gray-100 focus:ring-4 focus:ring-gray-100 font-medium rounded-full text-sm py-2.5 dark:bg-gray-800 dark:text-white dark:border-gray-600 dark:hover:bg-gray-700 dark:hover:border-gray-600 dark:focus:ring-gray-700 mt-2">
+                      Sync Skipped Destination Contacts
+                    </button>
+                  </form>
+                  <!-- END NEW SYNC BUTTONS -->
+
+                  <form action="{{ route('wix.contacts.cleanup.orphans', $store->id) }}" method="POST">
+                      @csrf
+                      <button type="submit" class="inline-flex w-full items-center justify-center bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500/60 rounded-full mt-2">
+                          Clean Duplicate Contacts in Destination Store
+                      </button>
+                  </form>
+
+                  <!-- Source Store Sync -->
+                  <form action="{{ route('wix.contacts.compare.export', $store->id) }}" method="POST">
+                      @csrf
+                      <button type="submit"
+                            class="w-full inline-flex items-center justify-center text-gray-900 bg-white border border-gray-300 focus:outline-none hover:bg-gray-100 focus:ring-4 focus:ring-gray-100 font-medium rounded-full text-sm py-2.5 dark:bg-gray-800 dark:text-white dark:border-gray-600 dark:hover:bg-gray-700 dark:hover:border-gray-600 dark:focus:ring-gray-700 mt-2">
+                          Compare & Export Missing Contacts
+                      </button>
+                  </form>
+                </div>
+              @endif
             @else
               <div class="rounded-lg border border-yellow-700 bg-yellow-900/30 p-4 text-yellow-200">
                 Route mapping for “{{ $title }}” not found.

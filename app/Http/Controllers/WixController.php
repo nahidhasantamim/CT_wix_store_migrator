@@ -134,8 +134,12 @@ class WixController extends Controller
     // Show logs
     public function logs(Request $request)
     {
-        $logs = WixLog::where('user_id', Auth::user()->id)->orderBy('id', 'desc')->get();
+        $logs = WixLog::where('user_id', Auth::id())
+            ->orderBy('id', 'desc')
+            ->paginate(25); // loads 25 logs per page
+
         return view('logs', compact('logs'));
     }
+
 
 }

@@ -2786,4 +2786,319 @@ class WixContactController extends Controller
         return [$gteIso, $lteIso];
     }
 
+
+    /**
+     * Compare source (from_store) and destination (to_store) contacts.
+     * If destination missing any → export missing ones in JSON.
+     */
+    public function compareAndExportMissingContacts(WixStore $store)
+    {
+        // Auth check
+        if ($store->user_id !== Auth::id()) {
+            return back()->with('error', 'Unauthorized store access.');
+        }
+
+        $toStoreId = $store->instance_id;
+
+        // Find first matching from_store_id for this to_store
+        $migrationRecord = WixContactMigration::where('to_store_id', $toStoreId)->first();
+        if (!$migrationRecord) {
+            return back()->with('error', 'No source store found for this destination store.');
+        }
+
+        $fromStoreId = $migrationRecord->from_store_id;
+        $fromStore = WixStore::where('instance_id', $fromStoreId)->first();
+        if (!$fromStore) {
+            return back()->with('error', 'Source store not found.');
+        }
+
+        WixHelper::log('ContactCompare', [
+            'from_store' => $fromStore->store_name,
+            'to_store'   => $store->store_name,
+            'msg'        => 'Starting contact comparison between source and destination stores',
+        ]);
+
+        // Fetch all contacts from both stores
+        $sourceAccessToken = WixHelper::getAccessToken($fromStore->instance_id);
+        $destAccessToken   = WixHelper::getAccessToken($store->instance_id);
+
+        $sourceContacts = $this->getContactsFromWix($sourceAccessToken);
+        $destContacts   = $this->getContactsFromWix($destAccessToken);
+
+        if (empty($sourceContacts)) {
+            return back()->with('error', 'No contacts found in source store.');
+        }
+
+        // Normalize email lists
+        $sourceEmails = collect($sourceContacts)
+            ->pluck('info.emails.0.email')
+            ->filter()
+            ->map(fn($e) => strtolower(trim($e)))
+            ->unique()
+            ->values()
+            ->toArray();
+
+        $destEmails = collect($destContacts)
+            ->pluck('info.emails.0.email')
+            ->filter()
+            ->map(fn($e) => strtolower(trim($e)))
+            ->unique()
+            ->values()
+            ->toArray();
+
+        // Compare and find missing
+        $missingEmails = array_diff($sourceEmails, $destEmails);
+
+        if (empty($missingEmails)) {
+            WixHelper::log('ContactCompare', [
+                'from_store' => $fromStore->store_name,
+                'to_store'   => $store->store_name,
+                'msg'        => 'All contacts exist in destination store',
+            ]);
+            return back()->with('success', 'All contacts are already synced between both stores.');
+        }
+
+        // Collect full info for missing contacts
+        $missingContacts = collect($sourceContacts)->filter(function ($contact) use ($missingEmails) {
+            $email = strtolower($contact['info']['emails'][0]['email'] ?? '');
+            return in_array($email, $missingEmails);
+        })->values()->toArray();
+
+        // Export to JSON file
+        $filename = 'missing_contacts_' . now()->format('Ymd_His') . '.json';
+        $path = storage_path("app/public/exports/{$filename}");
+        if (!file_exists(dirname($path))) {
+            mkdir(dirname($path), 0777, true);
+        }
+
+        file_put_contents($path, json_encode($missingContacts, JSON_PRETTY_PRINT));
+
+        WixHelper::log('ContactCompare', [
+            'from_store' => $fromStore->store_name,
+            'to_store'   => $store->store_name,
+            'missing_count' => count($missingContacts),
+            'file' => $filename,
+            'msg' => 'Exported missing contacts from source store',
+        ]);
+
+        return back()->with('success', "Found " . count($missingContacts) . " missing contacts. Exported to {$filename}");
+    }
+
+
+    /**
+     * Sync skipped contacts using Wix Contacts Query API for email-based lookups.
+     */
+    public function syncDestinationContacts(WixStore $store)
+    {
+        // 1. Authorization
+        if ($store->user_id !== Auth::id()) {
+            return back()->with('error', 'Unauthorized store access.');
+        }
+
+        // 2. Get all skipped contacts
+        $skippedContacts = WixContactMigration::where('status', 'skipped')->get();
+        if ($skippedContacts->isEmpty()) {
+            return back()->with('success', 'No skipped contacts found.');
+        }
+
+        $accessToken = WixHelper::getAccessToken($store->instance_id);
+        $updated = 0;
+        $skippedCount = 0;
+
+        foreach ($skippedContacts as $contact) {
+            $email = strtolower(trim($contact->contact_email ?? $contact->email ?? ''));
+            if (!$email) continue;
+
+            // --- 3. Query Wix contacts API for this email ---
+            $response = Http::withToken($accessToken)
+                ->post('https://www.wixapis.com/contacts/v4/contacts/query', [
+                    'query' => [
+                        'filter' => [
+                            'info.emails.email' => $email,
+                        ],
+                    ],
+                    'fieldsets' => ['BASIC'],
+                ]);
+
+            if (!$response->successful()) {
+                $contact->update(['error_message' => 'Failed to query Wix API']);
+                continue;
+            }
+
+            $contacts = $response->json('contacts') ?? [];
+            if (empty($contacts)) {
+                $contact->update([
+                    'error_message' => 'No matching contact found in Wix.',
+                ]);
+                $skippedCount++;
+                continue;
+            }
+
+            // --- 4. Determine which contact ID to use ---
+            $contactIds = collect($contacts)->pluck('id')->toArray();
+            $usedIds = WixContactMigration::where('status', 'success')
+                ->whereIn('destination_contact_id', $contactIds)
+                ->pluck('destination_contact_id')
+                ->toArray();
+
+            $selectedId = null;
+            
+            // pick first unused contact id
+            foreach ($contactIds as $id) {
+                if (!in_array($id, $usedIds)) {
+                    $selectedId = $id;
+                    break;
+                }
+            }
+
+            // if all used, but multiple exist → use first anyway
+            if (!$selectedId && count($contactIds) > 0) {
+                $selectedId = $contactIds[0];
+            }
+
+            // --- 5. Update DB accordingly ---
+            if ($selectedId) {
+                // check again if selectedId already used
+                $existsInDb = WixContactMigration::where('destination_contact_id', $selectedId)
+                    ->where('status', 'success')
+                    ->exists();
+
+                if ($existsInDb) {
+                    $contact->update([
+                        'error_message' => 'Skipped because there is a successful entry for this in Wix and DB.',
+                    ]);
+                    $skippedCount++;
+                } else {
+                    $contact->update([
+                        'to_store_id'             => $store->instance_id,
+                        'destination_contact_id'  => $selectedId,
+                        'status'                  => 'success',
+                        'error_message'           => 'Skipped entry updated.',
+                    ]);
+                    $updated++;
+                }
+            } else {
+                $contact->update([
+                    'error_message' => 'Skipped because all matching Wix IDs already used.',
+                ]);
+                $skippedCount++;
+            }
+        }
+
+        $msg = "Destination sync complete. {$updated} updated, {$skippedCount} skipped.";
+        return back()->with('success', $msg);
+    }
+
+
+    /**
+     * Delete Wix contacts in destination store that aren't in DB.
+     * Uses GET /contacts/v4/contacts (List Contacts API) with paging.limit=1000.
+     */
+    public function deleteOrphanDestinationContacts(WixStore $store)
+    {
+        if ($store->user_id !== Auth::id()) {
+            return back()->with('error', 'Unauthorized store access.');
+        }
+
+        $instanceId  = $store->instance_id;
+        $accessToken = WixHelper::getAccessToken($instanceId);
+        if (!$accessToken) {
+            return back()->with('error', 'Could not get Wix access token.');
+        }
+
+        WixHelper::log('OrphanCleanup', [
+            'store' => $store->store_name,
+            'msg'   => 'Starting orphan cleanup using GET /contacts API',
+        ]);
+
+        // --- Get valid contact IDs from DB ---
+        $validIds = WixContactMigration::where('to_store_id', $instanceId)
+            ->whereNotNull('destination_contact_id')
+            ->pluck('destination_contact_id')
+            ->filter()
+            ->unique()
+            ->values()
+            ->flip();
+
+        // --- Initialize counters ---
+        $seen = $kept = $deleted = $failed = 0;
+        $offset = 0;
+        $limit = 1000;
+
+        do {
+            // Fetch a page of contacts (up to 1000)
+            $url = "https://www.wixapis.com/contacts/v4/contacts?paging.limit={$limit}&paging.offset={$offset}&fieldsets=BASIC";
+
+            $response = Http::withToken($accessToken)->get($url);
+
+            if (!$response->successful()) {
+                WixHelper::log('OrphanCleanup', [
+                    'status' => $response->status(),
+                    'body'   => $response->body(),
+                    'note'   => 'Failed to fetch contacts; aborting.',
+                ]);
+                break;
+            }
+
+            $data = $response->json();
+            $contacts = $data['contacts'] ?? [];
+            $count = count($contacts);
+
+            foreach ($contacts as $c) {
+                $seen++;
+                $contactId = $c['id'] ?? null;
+                if (!$contactId) continue;
+
+                if (isset($validIds[$contactId])) {
+                    $kept++;
+                    continue;
+                }
+
+                // Not in DB → delete
+                try {
+                    $del = Http::withToken($accessToken)
+                        ->delete("https://www.wixapis.com/contacts/v4/contacts/{$contactId}");
+
+                    if ($del->successful()) {
+                        $deleted++;
+                        WixHelper::log('OrphanCleanup', [
+                            'contact_id' => $contactId,
+                            'action' => 'Deleted orphan contact from Wix',
+                        ]);
+                    } else {
+                        $failed++;
+                        WixHelper::log('OrphanCleanup', [
+                            'contact_id' => $contactId,
+                            'status' => $del->status(),
+                            'body' => $del->body(),
+                            'action' => 'Delete failed',
+                        ]);
+                    }
+                } catch (\Throwable $e) {
+                    $failed++;
+                    WixHelper::log('OrphanCleanup', [
+                        'contact_id' => $contactId,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            }
+
+            WixHelper::log('OrphanCleanup', [
+                'progress' => "Processed batch (offset {$offset}). Seen: {$seen}, Kept: {$kept}, Deleted: {$deleted}, Failed: {$failed}",
+            ]);
+
+            // Next batch
+            $offset += $limit;
+            usleep(200000); // slight delay for safety (0.2s)
+
+        } while ($count === $limit); // Continue if a full batch returned
+
+        $msg = "Orphan cleanup complete. Seen: {$seen}, Kept: {$kept}, Deleted: {$deleted}, Failed: {$failed}.";
+        WixHelper::log('OrphanCleanup', ['msg' => $msg]);
+
+        return back()->with('success', $msg);
+    }
+
+
+
 }

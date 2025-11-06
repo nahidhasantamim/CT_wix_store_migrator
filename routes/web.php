@@ -101,6 +101,15 @@ Route::middleware('auth')->group(function () {
     Route::get('/wix/{store}/export-contacts', [WixContactController::class, 'export'])->name('wix.export.contacts');
     Route::post('/wix/{store}/import-contacts', [WixContactController::class, 'import'])->name('wix.import.contacts');
 
+    Route::post('/stores/{store}/contacts/compare-and-export', 
+        [WixContactController::class, 'compareAndExportMissingContacts']
+    )->name('wix.contacts.compare.export');
+    Route::post('/wix/contacts/sync-destination/{store}', [WixContactController::class, 'syncDestinationContacts'])
+        ->name('wix.contacts.syncDestination');
+    Route::match(['GET', 'POST'], '/stores/{store}/contacts/cleanup-orphans', 
+        [WixContactController::class, 'deleteOrphanDestinationContacts']
+    )->name('wix.contacts.cleanup.orphans');
+
     // Members Migration Routes
     Route::get('/wix/{store}/export-members', [WixMemberMigrationController::class, 'export'])->name('wix.export.members');
     Route::post('/wix/{store}/import-members', [WixMemberMigrationController::class, 'import'])->name('wix.import.members');
@@ -129,6 +138,8 @@ Route::middleware('auth')->group(function () {
     Route::post('/wix/loyalty/auto-migrate', [WixLoyaltyAccountController::class, 'migrateAuto'])->name('wix.migrate.loyalty');
     Route::get('/wix/{store}/loyalty-export', [WixLoyaltyAccountController::class, 'export'])->name('wix.loyalty.export');
     Route::post('/wix/{store}/loyalty-import', [WixLoyaltyAccountController::class, 'import'])->name('wix.loyalty.import');
+
+
 
 
 });
