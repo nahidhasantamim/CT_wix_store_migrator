@@ -123,6 +123,19 @@
                             placeholder="e.g. 200">
                     </div>
 
+                    {{-- Start from order number --}}
+                    <div>
+                      <label class="block text-xs text-gray-300 mb-1" for="start_order_number_{{ $idx }}_{{ $store->id }}">
+                        Start after Order #
+                      </label>
+                      <input type="text" name="start_order_number" id="start_order_number_{{ $idx }}_{{ $store->id }}"
+                            class="w-full rounded-md border border-gray-600 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:ring-blue-500"
+                            placeholder="e.g. 105200">
+                      <p class="text-[11px] text-gray-400 mt-1">
+                        Fetches orders after this number (useful for next batch exports).
+                      </p>
+                    </div>
+
                     <p class="text-[11px] text-gray-400">
                       Dates are interpreted in <span class="font-medium text-gray-200">Pacific Time (PT)</span>, inclusive start/end of day.
                     </p>
@@ -205,6 +218,49 @@
                       Download
                     </button>
                   </form>
+                
+                @elseif (($conf['key'] ?? null) === 'gift_cards')
+                  {{-- Gift Cards export: optional date range + limit --}}
+                  <form action="{{ route($conf['export'], $store) }}" method="GET" class="space-y-3" x-data="{ useRange: false }">
+
+                    {{-- Enable date range --}}
+                    <label class="inline-flex items-center gap-2 text-sm text-gray-200">
+                      <input type="checkbox" name="use_date_range" value="1"
+                            x-model="useRange"
+                            class="h-4 w-4 rounded border-gray-600 bg-gray-700 text-blue-600 focus:ring-blue-500">
+                      Filter by creation date
+                    </label>
+
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-2"
+                        :class="{ 'opacity-100': useRange, 'opacity-60': !useRange }">
+                      <div>
+                        <label class="block text-xs text-gray-300 mb-1">Start Date</label>
+                        <input type="date" name="from_date"
+                              class="w-full rounded-md border border-gray-600 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                              :disabled="!useRange">
+                      </div>
+
+                      <div>
+                        <label class="block text-xs text-gray-300 mb-1">End Date</label>
+                        <input type="date" name="to_date"
+                              class="w-full rounded-md border border-gray-600 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                              :disabled="!useRange">
+                      </div>
+                    </div>
+
+                    {{-- Limit --}}
+                    <div>
+                      <label class="block text-xs text-gray-300 mb-1">Max Gift Cards (optional)</label>
+                      <input type="number" min="1" name="limit"
+                            class="w-full rounded-md border border-gray-600 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                            placeholder="e.g. 200">
+                    </div>
+
+                    <button type="submit"
+                            class="inline-flex w-full items-center justify-center rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 focus:ring-2 focus:ring-blue-500/60">
+                      Download
+                    </button>
+                  </form>
 
                 @else
                   {{-- Default export for all other entities --}}
@@ -216,7 +272,7 @@
               </div>
 
               {{-- Import --}}
-              <div class="rounded-lg border border-gray-700 bg-gray-800 p-3 sm:p-4">
+              {{-- <div class="rounded-lg border border-gray-700 bg-gray-800 p-3 sm:p-4">
                 <h3 class="text-sm font-semibold text-white mb-2 text-center">Import {{ $conf['label'] }}</h3>
                 <form action="{{ route($conf['import'], $store) }}" method="POST" enctype="multipart/form-data" class="w-full">
                   @csrf
@@ -233,7 +289,53 @@
                     </button>
                   </div>
                 </form>
+              </div> --}}
+
+              {{-- Import --}}
+              <div class="rounded-lg border border-gray-700 bg-gray-800 p-3 sm:p-4">
+                <h3 class="text-sm font-semibold text-white mb-2 text-center">Import {{ $conf['label'] }}</h3>
+
+                <form action="{{ route($conf['import'], $store) }}" method="POST" enctype="multipart/form-data" class="w-full">
+                  @csrf
+
+                  <div class="relative">
+                    <input type="file"
+                          name="{{ $conf['key'] }}_json"
+                          id="{{ $conf['key'] }}_json_{{ $idx }}_{{ $store->id }}"
+                          accept=".json"
+                          class="block w-full cursor-pointer rounded-lg border border-gray-600 bg-gray-900 text-sm text-gray-200
+                                  file:mr-2 file:cursor-pointer file:rounded-l-lg file:border-0 file:bg-gray-700
+                                  file:px-3 file:py-2 file:text-gray-100 focus:border-blue-500 focus:ring-blue-500"
+                          required>
+
+                    {{-- Submit Button --}}
+                    <button type="submit"
+                            class="mt-2 inline-flex w-full items-center justify-center rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white
+                                  hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500/60 sm:absolute sm:top-0 sm:right-0
+                                  sm:mt-0 sm:h-full sm:w-auto sm:rounded-l-none">
+                      Upload
+                    </button>
+                  </div>
+
+                  {{-- ✔ ONLY show for Gift Cards --}}
+                  @if($conf['key'] === 'gift_cards')
+                    <div class="mt-3 flex items-center space-x-2 bg-gray-900 border border-gray-700 rounded-lg p-3">
+                      <input type="checkbox"
+                            name="send_notification"
+                            id="send_notification_{{ $idx }}_{{ $store->id }}"
+                            value="1"
+                            class="h-4 w-4 rounded border-gray-600 bg-gray-800 text-blue-600 focus:ring-blue-500">
+
+                      <label for="send_notification_{{ $idx }}_{{ $store->id }}"
+                            class="text-sm text-gray-300 cursor-pointer">
+                        Send email notification to recipient?
+                      </label>
+                    </div>
+                  @endif
+
+                </form>
               </div>
+
 
               @if (($conf['key'] ?? null) === 'contacts')
                 <!-- NEW SYNC BUTTONS -->

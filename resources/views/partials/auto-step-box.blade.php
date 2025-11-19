@@ -126,6 +126,61 @@
         </div>
       @endif
 
+      {{-- Gift Cards-specific options --}}
+      @if (($cfg['key'] ?? null) === 'gift_cards_auto')
+        <div class="mt-2 space-y-4">
+
+          {{-- Hard limit --}}
+          <div class="sm:w-1/3 w-full">
+            <label for="auto_gc_limit_{{ $idx }}" class="block mb-2 text-sm font-medium text-gray-900 dark:text-white">
+              Max gift cards (optional)
+            </label>
+            <input type="number" min="1" name="limit" id="auto_gc_limit_{{ $idx }}"
+                  class="bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5
+                          dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white"
+                  placeholder="e.g. 200">
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Hard cap per run. Leave empty for no cap.</p>
+          </div>
+
+          {{-- Date Range Enable --}}
+          <label class="inline-flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
+            <input type="checkbox" name="use_date_range" value="1"
+                  x-model="useRange"
+                  class="h-4 w-4 rounded border-gray-300 bg-gray-50 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-700">
+            Filter by gift card creation date
+          </label>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3"
+              :class="{ 'opacity-100': useRange, 'opacity-60': !useRange }">
+            <div>
+              <label for="auto_gc_date_from_{{ $idx }}" class="block mb-1 text-xs font-medium text-gray-900 dark:text-gray-300">
+                Start date
+              </label>
+              <input type="date" name="from_date" id="auto_gc_date_from_{{ $idx }}"
+                    :disabled="!useRange"
+                    class="w-full rounded-md border border-gray-300 bg-gray-50 px-3 py-2 text-sm text-gray-900 focus:border-blue-500 focus:ring-blue-500
+                            dark:bg-gray-700 dark:border-gray-600 dark:text-white">
+            </div>
+
+            <div>
+              <label for="auto_gc_date_to_{{ $idx }}" class="block mb-1 text-xs font-medium text-gray-900 dark:text-gray-300">
+                End date
+              </label>
+              <input type="date" name="to_date" id="auto_gc_date_to_{{ $idx }}"
+                    :disabled="!useRange"
+                    class="w-full rounded-md border border-gray-300 bg-gray-50 px-3 py-2 text-sm text-gray-900 focus:border-blue-500 focus:ring-blue-500
+                            dark:bg-gray-700 dark:border-gray-600 dark:text-white">
+            </div>
+          </div>
+
+          <p class="text-[11px] text-gray-500 dark:text-gray-400">
+            Dates are interpreted in <span class="font-medium text-gray-800 dark:text-gray-200">Pacific Time (PT)</span>,
+            inclusive start/end of day.
+          </p>
+
+        </div>
+      @endif
+
       <div class="flex items-center justify-between pt-2">
         <button type="submit"
                 class="text-white bg-blue-700 hover:bg-blue-800 focus:ring-4 focus:outline-none focus:ring-blue-300 font-medium rounded-lg text-sm px-5 py-2.5

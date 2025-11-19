@@ -6,7 +6,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
-
+use Illuminate\Support\Str;
 use App\Models\WixStore;
 use App\Helpers\WixHelper;
 use App\Models\WixGiftCardMigration;
@@ -434,36 +434,33 @@ class WixGiftCardController extends Controller
             return back()->with('error', 'Could not get Wix access token.');
         }
 
-        if (!$request->hasFile('giftcards_json')) {
+        if (!$request->hasFile('gift_cards_json')) {
             WixHelper::log('Import Gift Cards', "No file uploaded for store: {$store->store_name}.", 'error');
             return back()->with('error', 'No file uploaded.');
         }
 
-        $json    = file_get_contents($request->file('giftcards_json')->getRealPath());
+        $json    = file_get_contents($request->file('gift_cards_json')->getRealPath());
         $decoded = json_decode($json, true);
         if (!is_array($decoded)) {
             WixHelper::log('Import Gift Cards', 'Invalid JSON uploaded.', 'error');
             return back()->with('error', 'Invalid JSON file.');
         }
 
-        // Inline helpers (scoped to import)
+        $sendNotification = $request->boolean('send_notification');
+
         $ensureBearer = fn(string $t) => preg_match('/^Bearer\s+/i', $t) ? $t : ('Bearer '.$t);
         $authHeader   = $ensureBearer($accessToken);
 
         $createdAtMillis = function (array $item): int {
-            foreach (['createdDate','dateCreated','createdAt','creationDate','date_created'] as $k) {
-                if (array_key_exists($k, $item)) {
+            $try = ['createdDate', 'dateCreated', 'createdAt', 'creationDate', 'date_created'];
+            foreach ($try as $k) {
+                if (!empty($item[$k])) {
                     $v = $item[$k];
                     if (is_numeric($v)) return (int)$v;
-                    if (is_string($v)) { $ts = strtotime($v); if ($ts !== false) return $ts * 1000; }
-                }
-            }
-            foreach ([['audit','createdDate'], ['audit','dateCreated'], ['metadata','createdDate'], ['metadata','dateCreated']] as $path) {
-                $cur = $item;
-                foreach ($path as $p) { if (!is_array($cur) || !array_key_exists($p, $cur)) { $cur=null; break; } $cur=$cur[$p]; }
-                if ($cur !== null) {
-                    if (is_numeric($cur)) return (int)$cur;
-                    if (is_string($cur)) { $ts = strtotime($cur); if ($ts !== false) return $ts * 1000; }
+                    if (is_string($v)) {
+                        $ts = strtotime($v);
+                        if ($ts !== false) return $ts * 1000;
+                    }
                 }
             }
             return PHP_INT_MAX;
@@ -478,239 +475,173 @@ class WixGiftCardController extends Controller
 
         $sanitizeNotificationInfo = function (array $ni): ?array {
             $out = [];
-            if (!empty($ni['recipient']) && is_array($ni['recipient'])) {
+
+            if (!empty($ni['recipient'])) {
                 $r = [];
                 if (!empty($ni['recipient']['email'])) $r['email'] = $ni['recipient']['email'];
                 if (!empty($ni['recipient']['name']))  $r['name']  = $ni['recipient']['name'];
                 if ($r) $out['recipient'] = $r;
             }
-            if (!empty($ni['sender']) && is_array($ni['sender'])) {
+
+            if (!empty($ni['sender'])) {
                 $s = [];
                 if (!empty($ni['sender']['email'])) $s['email'] = $ni['sender']['email'];
                 if (!empty($ni['sender']['name']))  $s['name']  = $ni['sender']['name'];
                 if ($s) $out['sender'] = $s;
             }
+
             if (!$out) return null;
+
             if (!empty($ni['notificationDate']))     $out['notificationDate']     = $ni['notificationDate'];
             if (!empty($ni['personalizedMessage']))  $out['personalizedMessage']  = $ni['personalizedMessage'];
+
             return $out;
         };
 
-        $getStoreCurrency = function (string $authHeader) {
-            $resp = Http::withHeaders([
-                'Authorization' => $authHeader,
-                'Content-Type'  => 'application/json',
-            ])->get('https://www.wixapis.com/stores/v2/settings');
-
-            if (!$resp->ok()) {
-                WixHelper::log('Import Gift Cards', 'Get store settings failed: status='.$resp->status().' body='.$resp->body(), 'error');
-                return null;
-            }
-            $j = $resp->json();
-            return $j['storeSettings']['currency'] ?? $j['currency'] ?? null;
-        };
-
-        // Resolve from_store_id (request > meta > legacy)
         $explicitFromStoreId = $request->input('from_store_id')
-            ?: ($decoded['meta']['from_store_id'] ?? ($decoded['from_store_id'] ?? null));
+            ?: ($decoded['meta']['from_store_id'] ?? null);
+
         if (!$explicitFromStoreId) {
-            return back()->with('error', 'from_store_id is required. Provide it as a field or include meta.from_store_id / from_store_id in the JSON.');
+            return back()->with('error', 'from_store_id is required.');
         }
 
-        // Accept both gift_cards and giftCards keys
         $giftCards = $decoded['gift_cards'] ?? $decoded['giftCards'] ?? null;
         if (!is_array($giftCards)) {
-            WixHelper::log('Import Gift Cards', 'Invalid JSON structure: missing gift_cards/giftCards array.', 'error');
-            return back()->with('error', 'Invalid JSON structure. Required key: gift_cards (or giftCards).');
+            WixHelper::log('Import Gift Cards', 'Invalid JSON: missing gift_cards array.', 'error');
+            return back()->with('error', 'Invalid JSON structure.');
         }
 
-        // Oldest-first import
         usort($giftCards, fn($a, $b) => $createdAtMillis($a) <=> $createdAtMillis($b));
 
-        // Lock/claim pattern (coupon-style)
         $claimPendingRow = function (?string $sourceId) use ($userId, $explicitFromStoreId) {
-            return DB::transaction(function () use ($userId, $explicitFromStoreId, $sourceId) {
-                $row = null;
-
-                if ($sourceId) {
-                    $row = WixGiftCardMigration::where('user_id', $userId)
-                        ->where('from_store_id', $explicitFromStoreId)
-                        ->where('status', 'pending')
-                        ->where(function ($q) use ($sourceId) {
-                            $q->where('source_gift_card_id', $sourceId)
-                              ->orWhereNull('source_gift_card_id');
-                        })
-                        ->orderByRaw("CASE WHEN source_gift_card_id = ? THEN 0 ELSE 1 END", [$sourceId])
-                        ->orderBy('created_at', 'asc')
-                        ->lockForUpdate()
-                        ->first();
-                }
-                if (!$row) {
-                    $row = WixGiftCardMigration::where('user_id', $userId)
-                        ->where('from_store_id', $explicitFromStoreId)
-                        ->where('status', 'pending')
-                        ->orderBy('created_at', 'asc')
-                        ->lockForUpdate()
-                        ->first();
-                }
-                return $row;
+            return DB::transaction(function () use ($userId, $explicitFromStoreId) {
+                return WixGiftCardMigration::where('user_id', $userId)
+                    ->where('from_store_id', $explicitFromStoreId)
+                    ->where('status', 'pending')
+                    ->orderBy('created_at', 'asc')
+                    ->lockForUpdate()
+                    ->first();
             }, 3);
         };
 
         $resolveTargetRow = function ($claimed, ?string $sourceId) use ($userId, $explicitFromStoreId, $toStoreId) {
-            if ($sourceId) {
-                $existing = WixGiftCardMigration::where('user_id', $userId)
-                    ->where('from_store_id', $explicitFromStoreId)
-                    ->where('to_store_id', $toStoreId)
-                    ->where('source_gift_card_id', $sourceId)
-                    ->orderBy('created_at', 'asc')
-                    ->first();
-
-                if ($existing) {
-                    if ($claimed && $claimed->id !== $existing->id && $claimed->status === 'pending') {
-                        $claimed->update([
-                            'status'        => 'skipped',
-                            'error_message' => 'Merged into existing migration row id '.$existing->id,
-                        ]);
-                    }
-                    return $existing;
-                }
-            }
-            return $claimed;
+            if (!$sourceId) return $claimed;
+            $existing = WixGiftCardMigration::where('user_id', $userId)
+                ->where('from_store_id', $explicitFromStoreId)
+                ->where('to_store_id', $toStoreId)
+                ->where('source_gift_card_id', $sourceId)
+                ->first();
+            return $existing ?: $claimed;
         };
 
         $imported = 0;
         $failed   = 0;
 
         foreach ($giftCards as $gc) {
+
             $sourceId = $gc['id'] ?? null;
             if (!$sourceId) continue;
 
-            // Target-aware skip
             $already = WixGiftCardMigration::where([
                 'user_id'             => $userId,
                 'from_store_id'       => $explicitFromStoreId,
                 'to_store_id'         => $toStoreId,
                 'source_gift_card_id' => $sourceId,
             ])->first();
+
             if ($already && $already->status === 'success') {
-                WixHelper::log('Import Gift Cards', "Skip (already imported): {$sourceId}.", 'debug');
                 continue;
             }
 
-            // Build clean payload
-            $payloadGc = $gc;
-            unset(
-                $payloadGc['id'],
-                $payloadGc['balance'],
-                $payloadGc['createdDate'],
-                $payloadGc['updatedDate'],
-                $payloadGc['disabledDate'],
-                $payloadGc['orderInfo'],
-                $payloadGc['code'] // obfuscated; do not re-import
-            );
-
-            // Normalize amount & currency
-            $amountRaw = $payloadGc['initialValue']['amount'] ?? null;
+            $amountRaw = $gc['initialValue']['amount'] ?? null;
             $amountStr = $amountRaw !== null ? number_format((float)$amountRaw, 2, '.', '') : null;
-            $resolvedCurrency = $payloadGc['currency'] ?? $getStoreCurrency($authHeader) ?? 'USD';
+            $currency  = $gc['currency'] ?? 'USD';
 
             $giftCardForCreate = [
                 'initialValue' => ['amount' => $amountStr],
-                'currency'     => $resolvedCurrency,
-                'source'       => $payloadGc['source'] ?? 'MANUAL',
+                'currency'     => $currency,
+                'source'       => $gc['source'] ?? 'MANUAL',
             ];
-            if (!empty($payloadGc['expirationDate'])) {
-                $giftCardForCreate['expirationDate'] = $payloadGc['expirationDate'];
-            }
-            if (!empty($payloadGc['notificationInfo']) && is_array($payloadGc['notificationInfo'])) {
-                if ($cleanNI = $sanitizeNotificationInfo($payloadGc['notificationInfo'])) {
-                    $giftCardForCreate['notificationInfo'] = $cleanNI;
-                }
-            }
-            if (!empty($payloadGc['code_full'])) {
-                $giftCardForCreate['code'] = $payloadGc['code_full'];
+
+            if (!empty($gc['expirationDate'])) {
+                $giftCardForCreate['expirationDate'] = $gc['expirationDate'];
             }
 
-            // Validate
-            if (empty($giftCardForCreate['initialValue']['amount']) || empty($giftCardForCreate['currency'])) {
-                $err = 'Missing required initialValue.amount or currency.';
-                $claimed   = $claimPendingRow($sourceId);
-                $targetRow = $resolveTargetRow($claimed, $sourceId);
-                if ($targetRow) {
-                    $targetRow->update([
-                        'to_store_id'            => $toStoreId,
-                        'status'                 => 'failed',
-                        'error_message'          => $err,
-                        'initial_value_amount'   => $gc['initialValue']['amount'] ?? null,
-                        'currency'               => $gc['currency'] ?? null,
-                        'source_code_suffix'     => $gc['code'] ?? $targetRow->source_code_suffix,
-                        'source_gift_card_id'    => $targetRow->source_gift_card_id ?: ($gc['id'] ?? null),
-                    ]);
+            if (!empty($gc['notificationInfo'])) {
+                if ($sendNotification) {
+                    if ($clean = $sanitizeNotificationInfo($gc['notificationInfo'])) {
+                        $giftCardForCreate['notificationInfo'] = $clean;
+                    }
                 }
-                $failed++;
-                WixHelper::log('Import Gift Cards', "Skip {$sourceId}: {$err}", 'error');
-                continue;
             }
 
-            // Create with idempotency + alt-schema retry if 500
+            if (
+                isset($gc['source']) &&
+                strtoupper($gc['source']) === 'ORDER' &&
+                isset($gc['orderInfo']['orderId'])
+            ) {
+                $giftCardForCreate['source'] = 'ORDER';
+                $giftCardForCreate['orderInfo'] = [
+                    'orderId' => $gc['orderInfo']['orderId'],
+                ];
+            }
+
             $payload = [
                 'giftCard'       => $giftCardForCreate,
                 'idempotencyKey' => 'gc-'.$uuid4(),
             ];
+
             $result = $this->createGiftCardInWix($authHeader, $payload);
 
-            // Claim & resolve row after API call
             $claimed   = $claimPendingRow($sourceId);
             $targetRow = $resolveTargetRow($claimed, $sourceId);
 
             if (isset($result['giftCard']['id'])) {
+
                 $newId = $result['giftCard']['id'];
-                if ($targetRow) {
-                    DB::transaction(function () use ($targetRow, $toStoreId, $newId, $giftCardForCreate, $gc) {
-                        $targetRow->update([
-                            'to_store_id'                => $toStoreId,
-                            'destination_gift_card_id'   => $newId,
-                            'status'                     => 'success',
-                            'error_message'              => null,
-                            'initial_value_amount'       => $giftCardForCreate['initialValue']['amount'] ?? $targetRow->initial_value_amount,
-                            'currency'                   => $giftCardForCreate['currency'] ?? $targetRow->currency,
-                            'source_code_suffix'         => $gc['code'] ?? $targetRow->source_code_suffix,
-                            'source_gift_card_id'        => $targetRow->source_gift_card_id ?: ($gc['id'] ?? null),
-                        ]);
-                    }, 3);
+
+                if (!empty($gc['disabledDate'])) {
+                    $disableEndpoint = "https://www.wixapis.com/gift-cards/v1/gift-cards/{$newId}/disable";
+                    $disableResp = Http::withHeaders([
+                        'Authorization' => $authHeader,
+                        'Content-Type'  => 'application/json'
+                    ])->post($disableEndpoint, (object)[]);
+
+                    WixHelper::log(
+                        'Import Gift Cards',
+                        "Disable attempt for {$newId}: status=".$disableResp->status()." body=".$disableResp->body(),
+                        $disableResp->ok() ? 'success' : 'error'
+                    );
                 }
+
+                if ($targetRow) {
+                    $targetRow->update([
+                        'to_store_id'              => $toStoreId,
+                        'destination_gift_card_id' => $newId,
+                        'status'                   => 'success',
+                        'error_message'            => null,
+                        'source_gift_card_id'      => $sourceId,
+                    ]);
+                }
+
                 $imported++;
-                WixHelper::log('Import Gift Cards', "Imported gift card (new ID: {$newId}).", 'success');
-            } else {
-                $errorMsg = json_encode([
-                    'status'   => $result['status'] ?? null,
-                    'sent'     => ['giftCard' => $giftCardForCreate],
-                    'response' => $result
-                ]);
-                if ($targetRow) {
-                    DB::transaction(function () use ($targetRow, $toStoreId, $giftCardForCreate, $gc, $errorMsg) {
-                        $targetRow->update([
-                            'to_store_id'                => $toStoreId,
-                            'destination_gift_card_id'   => null,
-                            'status'                     => 'failed',
-                            'error_message'              => $errorMsg,
-                            'initial_value_amount'       => $giftCardForCreate['initialValue']['amount'] ?? $targetRow->initial_value_amount,
-                            'currency'                   => $giftCardForCreate['currency'] ?? $targetRow->currency,
-                            'source_code_suffix'         => $gc['code'] ?? $targetRow->source_code_suffix,
-                            'source_gift_card_id'        => $targetRow->source_gift_card_id ?: ($gc['id'] ?? null),
-                        ]);
-                    }, 3);
-                }
+            }
+            else {
                 $failed++;
-                WixHelper::log('Import Gift Cards', "Failed {$sourceId}: {$errorMsg}", 'error');
+                if ($targetRow) {
+                    $targetRow->update([
+                        'to_store_id'            => $toStoreId,
+                        'status'                 => 'failed',
+                        'error_message'          => json_encode($result),
+                    ]);
+                }
             }
         }
 
         if ($imported > 0) {
-            WixHelper::log('Import Gift Cards', "Done. Imported={$imported}; failed={$failed}.", $failed ? 'warn' : 'success');
             return back()->with('success', "{$imported} gift card(s) imported. Failed: {$failed}");
         }
+
         return back()->with('error', $failed ? "No gift cards imported. Failed: {$failed}" : 'Nothing to import.');
     }
 
@@ -755,35 +686,31 @@ class WixGiftCardController extends Controller
     {
         $ensureBearer = fn(string $t) => preg_match('/^Bearer\s+/i', $t) ? $t : ('Bearer '.$t);
 
-        $create = function(array $body) use ($accessTokenOrHeader, $ensureBearer) {
+        $call = function(array $body) use ($ensureBearer, $accessTokenOrHeader) {
             return Http::withHeaders([
                 'Authorization' => $ensureBearer($accessTokenOrHeader),
                 'Content-Type'  => 'application/json'
             ])->post('https://www.wixapis.com/gift-cards/v1/gift-cards', $body);
         };
 
-        // Attempt #1
-        $resp1 = $create($payload);
-        WixHelper::log('Import Gift Cards', 'Create gift card attempt#1: status='.$resp1->status().' body='.$resp1->body(), $resp1->ok() ? 'debug' : 'error');
-        if ($resp1->ok()) {
-            return $resp1->json();
-        }
+        $resp1 = $call($payload);
+        WixHelper::log('Import Gift Cards', 'Create attempt #1: '.$resp1->status().' '.$resp1->body(), $resp1->ok() ? 'info' : 'error');
 
-        // Attempt #2: move currency -> initialValue.currency if server error (schema quirk on some tenants)
-        if ($resp1->status() === 500 && isset($payload['giftCard'])) {
+        if ($resp1->ok()) return $resp1->json();
+
+        if ($resp1->status() === 500 && isset($payload['giftCard']['currency'])) {
             $alt = $payload;
-            if (isset($alt['giftCard']['currency'])) {
-                $altCurrency = $alt['giftCard']['currency'];
-                unset($alt['giftCard']['currency']);
-                $alt['giftCard']['initialValue']['currency'] = $altCurrency;
-            }
+            $alt['giftCard']['initialValue']['currency'] = $alt['giftCard']['currency'];
+            unset($alt['giftCard']['currency']);
 
-            $resp2 = $create($alt);
-            WixHelper::log('Import Gift Cards', 'Create gift card attempt#2 (alt schema): status='.$resp2->status().' body='.$resp2->body(), $resp2->ok() ? 'debug' : 'error');
+            $resp2 = $call($alt);
+            WixHelper::log('Import Gift Cards', 'Create attempt #2: '.$resp2->status().' '.$resp2->body(), $resp2->ok() ? 'info' : 'error');
             return $resp2->json();
         }
 
-        // Fallthrough
         return $resp1->json();
     }
+
+
+
 }

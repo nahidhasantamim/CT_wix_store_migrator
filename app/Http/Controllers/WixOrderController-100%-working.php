@@ -1020,85 +1020,153 @@ class WixOrderController extends Controller
 private function createOrderInWix(string $auth, array &$order): array
 {
     try {
-
-        /**
-         * --------------------------------------------------------
-         *  UNIVERSAL CLEANUP (Recursive + Safe List)
-         * --------------------------------------------------------
-         */
-        $clean = function (&$data) use (&$clean) {
-
-            // Arrays that Wix ALLOWS to be list-type arrays
-            $allowedListArrays = [
-                'lineItems',
-                'descriptionLines',
-                'activities',
-                'taxBreakdown',
-                'payments',
-                'refunds',
-                'fulfillments',
-                'modifierGroups',
-            ];
-
-            if (is_array($data)) {
-                foreach ($data as $key => &$value) {
-
-                    // Remove geocode: []
-                    if ($key === 'geocode' && empty($value)) {
-                        unset($data[$key]);
-                        continue;
-                    }
-
-                    // ❗ DO NOT delete valid Wix list arrays
-                    if (is_array($value) && array_is_list($value)) {
-                        if (!in_array($key, $allowedListArrays)) {
-                            unset($data[$key]);
-                        }
-                        continue;
-                    }
-
-                    // Recursion
-                    if (is_array($value)) {
-                        $clean($value);
-                    }
-
-                    // Remove empty values
-                    if (
-                        $value === null ||
-                        $value === '' ||
-                        $value === [] ||
-                        (is_object($value) && empty((array)$value))
-                    ) {
-                        unset($data[$key]);
-                    }
-                }
-            }
-        };
-
-        // Apply cleanup
-        $clean($order);
-
-
-        /**
-         * --------------------------------------------------------
-         *  YOUR EXISTING DUPLICATE-SKIP LOGIC
-         * --------------------------------------------------------
-         */
+        // =============================================
+        //  Duplicate Creation Guard
+        // =============================================
         if (!empty($order['migration_result']) && $order['migration_result'] === 'success') {
             WixHelper::log('Order Create', "Skipping duplicate create for order {$order['number']}", 'warn');
             return ['success' => true, 'message' => 'Already created'];
         }
 
+        // =============================================
+        //  Normalize Payload Before Sending
+        // =============================================
 
-        /**
-         * --------------------------------------------------------
-         *  SPECIAL FIXES BEFORE POST (lineItems flatten + price sanitization)
-         * --------------------------------------------------------
-         */
+        // Remove invalid createdBy (empty or wrong format)
+        if (isset($order['createdBy'])) {
+            if (empty($order['createdBy']) || (is_array($order['createdBy']) && array_is_list($order['createdBy']))) {
+                unset($order['createdBy']);
+            }
+        }
+
+        // Ensure proper object-type fields
+        foreach (['channelInfo', 'priceSummary', 'buyerInfo'] as $objKey) {
+            if (isset($order[$objKey]) && is_array($order[$objKey]) && array_is_list($order[$objKey])) {
+                unset($order[$objKey]);
+            }
+        }
+
+        // Normalize lineItems
         if (isset($order['lineItems']) && is_array($order['lineItems'])) {
             $order['lineItems'] = array_values($order['lineItems']);
         }
 
+        // Remove read-only fields
+        $removeKeys = [
+            'transactions', 'refundability', 'balanceSummary',
+            'activities', 'archived', 'purchaseFlowId',
+            'priceSummary.refundsSummary', 'priceSummary.balanceSummary'
+        ];
+        foreach ($removeKeys as $key) {
+            Arr::forget($order, $key);
+        }
+
+        // =============================================
+        // Log structure for debug
+        // =============================================
+        WixHelper::log('Order Debug', 'Final payload structure before POST', 'info', [
+            'source_number'    => $order['number'] ?? 'N/A',
+            'channel'          => $order['channelInfo']['type'] ?? 'N/A',
+            'has_lineItems'    => isset($order['lineItems']) && count($order['lineItems']) > 0,
+            'has_priceSummary' => isset($order['priceSummary']),
+            'createdBy_type'   => isset($order['createdBy']) ? gettype($order['createdBy']) : 'none',
+        ]);
+
+
+        // =============================================
+        // FIX: Normalize Shipping Structure
+        // =============================================
+        if (isset($order['shippingInfo']['cost'])) {
+
+            $shippingCost = &$order['shippingInfo']['cost'];
+
+            if (
+                isset($shippingCost['discount']['amount']) &&
+                (float)$shippingCost['discount']['amount'] > 0
+            ) {
+                unset($shippingCost['totalPriceBeforeTax']);
+                unset($shippingCost['totalPriceAfterTax']);
+                unset($shippingCost['taxDetails']);
+                unset($shippingCost['taxInfo']);
+            }
+
+            foreach ($shippingCost as $key => $value) {
+                if ($value === [] || $value === null || $value === '') {
+                    unset($shippingCost[$key]);
+                }
+            }
+        }
+
+        // =============================================
+        // FIX: Remove invalid empty taxBreakdown arrays
+        // =============================================
+
+        if (isset($order['taxInfo']['taxBreakdown']) && $order['taxInfo']['taxBreakdown'] === []) {
+            unset($order['taxInfo']['taxBreakdown']);
+        }
+
+        if (isset($order['lineItems'])) {
+            foreach ($order['lineItems'] as &$li) {
+                if (isset($li['taxInfo']['taxBreakdown']) && $li['taxInfo']['taxBreakdown'] === []) {
+                    unset($li['taxInfo']['taxBreakdown']);
+                }
+            }
+        }
+
+        if (isset($order['shippingInfo']['cost']['taxInfo']['taxBreakdown']) &&
+            $order['shippingInfo']['cost']['taxInfo']['taxBreakdown'] === []) {
+            unset($order['shippingInfo']['cost']['taxInfo']['taxBreakdown']);
+        }
+
+        // =============================================
+        // NEW FIX: Remove geocode: []
+        // =============================================
+        Arr::forget($order, 'shippingInfo.logistics.shippingDestination.address.geocode');
+        Arr::forget($order, 'recipientInfo.address.geocode');
+
+        // =============================================
+        // NEW FIX: Remove lineItems[].locations: []
+        // =============================================
+        if (isset($order['lineItems'])) {
+            foreach ($order['lineItems'] as &$li) {
+                if (isset($li['locations']) && $li['locations'] === []) {
+                    unset($li['locations']);
+                }
+            }
+        }
+
+        // =============================================
+        // NEW FIX: Remove appliedDiscounts: []
+        // =============================================
+        if (isset($order['appliedDiscounts']) && $order['appliedDiscounts'] === []) {
+            unset($order['appliedDiscounts']);
+        }
+
+        // =============================================
+        // NEW FIX: Remove additionalFees: []
+        // =============================================
+        if (isset($order['additionalFees']) && $order['additionalFees'] === []) {
+            unset($order['additionalFees']);
+        }
+
+        // ======================================================================
+        // 🔥🔥🔥 NEW PATCHES FOR FAILED ORDERS (DO NOT REMOVE ANYTHING ABOVE) 🔥🔥🔥
+        // ======================================================================
+
+        // =============================================
+        // PATCH A: Remove only refundQuantity (read-only)
+        // =============================================
+        if (!empty($order['lineItems'])) {
+            foreach ($order['lineItems'] as &$li) {
+                if (isset($li['refundQuantity'])) {
+                    unset($li['refundQuantity']);
+                }
+            }
+        }
+
+        // =============================================
+        // PATCH B: Normalize all price.amount values
+        // =============================================
         $priceKeys = [
             'price', 'priceBeforeDiscounts', 'priceBeforeDiscountsAndTax',
             'totalPriceBeforeTax', 'totalPriceAfterTax', 'lineItemPrice'
@@ -1106,23 +1174,18 @@ private function createOrderInWix(string $auth, array &$order): array
 
         if (!empty($order['lineItems'])) {
             foreach ($order['lineItems'] as &$li) {
-
                 foreach ($priceKeys as $k) {
                     if (isset($li[$k]['amount'])) {
                         $li[$k]['amount'] = (string) floatval($li[$k]['amount']);
                     }
                 }
-
                 if (isset($li['totalDiscount']['amount'])) {
                     $li['totalDiscount']['amount'] = (string) floatval($li['totalDiscount']['amount']);
-                }
-
-                if (isset($li['taxInfo']['taxBreakdown']) && $li['taxInfo']['taxBreakdown'] === []) {
-                    unset($li['taxInfo']['taxBreakdown']);
                 }
             }
         }
 
+        // Normalize shipping cost numeric values
         if (isset($order['shippingInfo']['cost'])) {
             foreach ($order['shippingInfo']['cost'] as $k => $v) {
                 if (is_array($v) && isset($v['amount'])) {
@@ -1131,6 +1194,7 @@ private function createOrderInWix(string $auth, array &$order): array
             }
         }
 
+        // Normalize priceSummary numeric values
         if (isset($order['priceSummary'])) {
             foreach ($order['priceSummary'] as $k => $v) {
                 if (is_array($v) && isset($v['amount'])) {
@@ -1139,26 +1203,14 @@ private function createOrderInWix(string $auth, array &$order): array
             }
         }
 
-
-        /**
-         * --------------------------------------------------------
-         *  FINAL CLEANUP (safe)
-         * --------------------------------------------------------
-         */
-        $clean($order);
+        // ======================================================================
+        // END OF NEW PATCHES
+        // ======================================================================
 
 
-        WixHelper::log('Order Debug', 'Final payload structure before POST', 'info', [
-            'source_number' => $order['number'] ?? 'N/A',
-            'channel'       => $order['channelInfo']['type'] ?? 'N/A',
-        ]);
-
-
-        /**
-         * --------------------------------------------------------
-         *  SEND ORDER
-         * --------------------------------------------------------
-         */
+        // =============================================
+        // Send order to Wix
+        // =============================================
         $response = Http::withHeaders([
             'Authorization' => $auth,
             'Content-Type'  => 'application/json',
@@ -1166,13 +1218,15 @@ private function createOrderInWix(string $auth, array &$order): array
             'order' => $order,
         ]);
 
+        // =============================================
+        // Handle response
+        // =============================================
         $json = $response->json();
 
         if (!$response->ok() || empty($json['order'])) {
             WixHelper::log('Order Create', 'Wix createOrderInWix failed', 'error', [
                 'response' => $json ?? $response->body(),
             ]);
-
             return [
                 'success' => false,
                 'message' => 'Wix createOrderInWix failed',
@@ -1180,20 +1234,21 @@ private function createOrderInWix(string $auth, array &$order): array
             ];
         }
 
-
-        /**
-         * --------------------------------------------------------
-         *  SUCCESS
-         * --------------------------------------------------------
-         */
+        // =============================================
+        // Success — mark as migrated
+        // =============================================
         $createdOrder = $json['order'];
         $order['migration_result'] = 'success';
 
         WixHelper::log('Order Create', 'Order created successfully', 'success', [
             'id'      => $createdOrder['id'] ?? null,
             'number'  => $createdOrder['number'] ?? 'auto',
+            'channel' => $order['channelInfo']['type'] ?? null,
         ]);
 
+        // =============================================
+        // Fulfillments (if present)
+        // =============================================
         if (!empty($order['fulfillments']['fulfillments'])) {
             foreach ($order['fulfillments']['fulfillments'] as $f) {
                 $this->createFulfillmentInWix($auth, $createdOrder['id'], $f);
@@ -1208,6 +1263,7 @@ private function createOrderInWix(string $auth, array &$order): array
     } catch (\Throwable $e) {
         WixHelper::log('Order Create', 'Exception during order creation', 'error', [
             'message' => $e->getMessage(),
+            'trace'   => $e->getTraceAsString(),
         ]);
 
         return [
@@ -1216,6 +1272,7 @@ private function createOrderInWix(string $auth, array &$order): array
         ];
     }
 }
+
 
 
 
