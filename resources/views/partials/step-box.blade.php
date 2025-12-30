@@ -10,6 +10,7 @@
     'Loyalty' => ['key' => 'loyalty', 'export' => 'wix.loyalty.export', 'import' => 'wix.loyalty.import', 'label' => 'Loyalty'],
     'Media' => ['key' => 'media', 'export' => 'wix.export.media', 'import' => 'wix.import.media', 'label' => 'Media'],
     'Contacts & Members' => ['key' => 'contacts', 'export' => 'wix.export.contacts', 'import' => 'wix.import.contacts', 'label' => 'Contacts & Members'], 
+    'Back in Stock' => ['key' => 'back_in_stock', 'export' => 'wix.export.back.in.stock', 'import' => 'wix.import.back.in.stock', 'label' => 'Back in Stock'], 
   ];
   // $isContactsMembers = ($title === 'Contacts & Members');
 @endphp

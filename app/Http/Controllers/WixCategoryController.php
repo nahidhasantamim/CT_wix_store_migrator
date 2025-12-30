@@ -482,6 +482,200 @@ class WixCategoryController extends Controller
         return back()->with('success', $summary);
     }
 
+    public function syncSeoData(Request $request)
+    {
+        WixHelper::log('Category SEO Sync', 'Sync started', 'info');
+
+        $request->validate([
+            'from_store' => 'required|string',
+            'to_store'   => 'required|string|different:from_store',
+        ]);
+
+        $fromId = $request->from_store;
+        $toId   = $request->to_store;
+        $userId = Auth::id() ?: 1;
+
+        WixHelper::log('Category SEO Sync', [
+            'from_store' => $fromId,
+            'to_store'   => $toId,
+            'user_id'    => $userId,
+        ], 'debug');
+
+        $fromToken = WixHelper::getAccessToken($fromId);
+        $toToken   = WixHelper::getAccessToken($toId);
+
+        if (!$fromToken || !$toToken) {
+            WixHelper::log('Category SEO Sync', 'Missing access token(s)', 'error');
+            return back()->with('error', 'Missing Wix access token(s).');
+        }
+
+        $rows = WixCollectionMigration::where([
+            'user_id'       => $userId,
+            'from_store_id' => $fromId,
+            'to_store_id'   => $toId,
+            'status'        => 'success',
+        ])->whereNotNull('destination_collection_id')->get();
+
+        WixHelper::log('Category SEO Sync', [
+            'total_collections' => $rows->count(),
+        ], 'info');
+
+        $updated = 0;
+        $failed  = 0;
+
+        foreach ($rows as $row) {
+            WixHelper::log('Category SEO Sync', [
+                'step'                     => 'processing collection',
+                'source_collection_id'     => $row->source_collection_id,
+                'destination_collection_id'=> $row->destination_collection_id,
+            ], 'debug');
+
+            try {
+                /* ---------- V1 FETCH ---------- */
+                $v1 = $this->getCollectionByIdV1(
+                    $fromToken,
+                    $row->source_collection_id,
+                    false
+                );
+
+                WixHelper::log('Category SEO Sync', [
+                    'step' => 'v1_fetch',
+                    'seo_tags' => $v1['collection']['seoSchema']['tags'] ?? [],
+                ], 'debug');
+
+                $tags = $v1['collection']['seoSchema']['tags'] ?? [];
+                if (empty($tags)) {
+                    WixHelper::log('Category SEO Sync', 'No SEO tags found, skipping', 'info');
+                    continue;
+                }
+
+                /* ---------- MAP SEO ---------- */
+                $seoData = $this->mapV1SeoToV3($tags);
+
+                WixHelper::log('Category SEO Sync', [
+                    'step'    => 'seo_mapped',
+                    'seoData' => $seoData,
+                ], 'debug');
+
+                /* ---------- V3 FETCH ---------- */
+                $detail = $this->getCategoryByIdV3(
+                    $toToken,
+                    $row->destination_collection_id,
+                    $this->defaultAppNamespace,
+                    $this->defaultTreeKey
+                );
+
+                WixHelper::log('Category SEO Sync', [
+                    'step'     => 'v3_fetch',
+                    'category' => $detail['category'] ?? null,
+                ], 'debug');
+
+                $revision = $detail['category']['revision'] ?? null;
+                if (!$revision) {
+                    throw new \Exception('Missing revision');
+                }
+
+                /* ---------- PATCH ---------- */
+                $payload = [
+                    'category' => [
+                        'revision' => (string)$revision,
+                        'seoData'  => $seoData,
+                    ],
+                    'treeReference' => $this->treeRefArray(
+                        $this->defaultAppNamespace,
+                        $this->defaultTreeKey
+                    ),
+                ];
+
+                WixHelper::log('Category SEO Sync', [
+                    'step'    => 'patch_payload',
+                    'payload' => $payload,
+                ], 'debug');
+
+                $resp = Http::withHeaders([
+                    'Authorization' => $this->ensureBearer($toToken),
+                    'Content-Type'  => 'application/json',
+                ])->patch(
+                    "https://www.wixapis.com/categories/v1/categories/{$row->destination_collection_id}",
+                    $payload
+                );
+
+                WixHelper::log('Category SEO Sync', [
+                    'step'   => 'patch_response',
+                    'status' => $resp->status(),
+                    'body'   => substr($resp->body(), 0, 2000),
+                ], $resp->ok() ? 'success' : 'error');
+
+                if (!$resp->ok()) {
+                    throw new \Exception($resp->body());
+                }
+
+                $updated++;
+            } catch (\Throwable $e) {
+                $failed++;
+
+                WixHelper::log('Category SEO Sync', [
+                    'step'  => 'exception',
+                    'error' => $e->getMessage(),
+                    'trace' => substr($e->getTraceAsString(), 0, 2000),
+                ], 'error');
+            }
+        }
+
+        WixHelper::log('Category SEO Sync', [
+            'completed' => true,
+            'updated'   => $updated,
+            'failed'    => $failed,
+        ], 'info');
+
+        return back()->with(
+            $failed ? 'warning' : 'success',
+            "SEO Sync completed. Updated={$updated}, Failed={$failed}"
+        );
+    }
+
+
+    protected function mapV1SeoToV3(array $tags): array
+    {
+        $out = [];
+
+        foreach ($tags as $tag) {
+            $type = $tag['type'] ?? null;
+            if (!$type) continue;
+
+            $entry = [
+                'type'     => $type,
+                'children' => $tag['children'] ?? '',
+                'custom'   => (bool)($tag['custom'] ?? false),
+                'disabled' => (bool)($tag['disabled'] ?? false),
+            ];
+
+            // TITLE
+            if ($type === 'title') {
+                $entry['children'] = (string)($tag['children'] ?? '');
+            }
+
+            // META (FLAT FORMAT — REQUIRED)
+            if ($type === 'meta' && !empty($tag['props'])) {
+                $entry['props'] = [
+                    'name'    => $tag['props']['name']    ?? null,
+                    'content' => $tag['props']['content'] ?? null,
+                ];
+
+                // Remove nulls
+                $entry['props'] = array_filter($entry['props'], fn ($v) => $v !== null);
+            }
+
+            // Skip invalid meta
+            if ($type === 'meta' && empty($entry['props'])) {
+                continue;
+            }
+
+            $out[] = $entry;
+        }
+
+        return ['tags' => $out];
+    }
 
 
 

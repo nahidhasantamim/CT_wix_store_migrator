@@ -9,7 +9,8 @@
     'Gift Cards'         => ['key' => 'gift_cards_auto',      'migrate' => 'wix.migrate.gift.cards',      'label' => 'Gift Cards'],
     'Loyalty'            => ['key' => 'loyalty_auto',         'migrate' => 'wix.migrate.loyalty',         'label' => 'Loyalty'],
     'Media'              => ['key' => 'media_auto',           'migrate' => 'wix.migrate.media',           'label' => 'Media'],
-    'Contacts & Members' => ['key' => 'contacts_members_auto','migrate' => 'wix.migrate.contacts.members', 'label' => 'Contacts & Members'], 
+    'Contacts & Members' => ['key' => 'contacts_members_auto','migrate' => 'wix.migrate.contacts.members','label' => 'Contacts & Members'], 
+    'Back in Stock'      => ['key' => 'back_in_stock_auto',   'migrate' => 'wix.migrate.back.in.stock',   'label' => 'Back in Stock'], 
   ];
 
   // Resolve current step config (and guard if missing)
@@ -182,11 +183,34 @@
       @endif
 
       <div class="flex items-center justify-between pt-2">
-        <button type="submit"
+        <div class="btn-group">
+          <button type="submit"
                 class="text-white bg-blue-700 hover:bg-blue-800 focus:ring-4 focus:outline-none focus:ring-blue-300 font-medium rounded-lg text-sm px-5 py-2.5
                        dark:bg-blue-600 dark:hover:bg-blue-700 dark:focus:ring-blue-800">
-          Start Migration
-        </button>
+            Start Migration
+          </button>
+          @if (($cfg['key'] ?? null) === 'categories_auto')
+          <button
+              type="submit"
+              formaction="{{ route('wix.categories.syncSeo') }}"
+              class="text-white bg-yellow-700 hover:bg-yellow-800 focus:ring-4 focus:outline-none focus:ring-yellow-300 font-medium rounded-lg text-sm px-5 py-2.5
+                       dark:bg-yellow-600 dark:hover:bg-yellow-700 dark:focus:ring-yellow-800"
+          >
+              Sync SEO Data
+          </button>
+          @endif
+          @if (($cfg['key'] ?? null) === 'products_auto')
+          <button
+              type="submit"
+              formaction="{{ route('wix.products.syncSeo') }}"
+              class="text-white bg-yellow-700 hover:bg-yellow-800 focus:ring-4 focus:outline-none focus:ring-yellow-300 font-medium rounded-lg text-sm px-5 py-2.5
+                       dark:bg-yellow-600 dark:hover:bg-yellow-700 dark:focus:ring-yellow-800"
+          >
+              Sync SEO Data
+          </button>
+          @endif
+        </div>
+        
         <p class="text-xs text-gray-500 dark:text-gray-400">
           <b class="text-blue-600">{{ $cfg['label'] }}</b> - Data will be automatically migrated from "FROM STORE" to "TO STORE"
         </p>

@@ -124,8 +124,8 @@ class WixProductController extends Controller
         // Map collections (ID -> slug) for the source so we can attach slugs
         $collectionIdToSlug = [];
         try {
-            $catController = app(\App\Http\Controllers\WixCategoryController::class);
-            $collectionsArr = $catController->getCollectionsFromWix($fromToken);
+            // $catController = app(\App\Http\Controllers\WixCategoryController::class);
+            $collectionsArr = $this->getCollectionsFromWixV1($fromToken);
             foreach (($collectionsArr['collections'] ?? []) as $c) {
                 if (!empty($c['id']) && !empty($c['slug'])) {
                     $collectionIdToSlug[$c['id']] = $c['slug'];
@@ -258,6 +258,25 @@ class WixProductController extends Controller
             $sourceId  = $product['id'] ?? null;
             $sourceSku = $product['sku'] ?? null;
 
+            // =========================================================
+            // NEW: Skip if this product was already successfully
+            // migrated to THIS destination store
+            // =========================================================
+            $alreadyMigrated = \App\Models\WixProductMigration::where('source_product_id', $sourceId)
+                ->where('to_store_id', $toStoreId)
+                ->where('status', 'success')
+                ->exists();
+
+            if ($alreadyMigrated) {
+                $skipped++;
+                WixHelper::log(
+                    'Auto Products',
+                    "SKIP: Product {$sourceId} already migrated to store {$toStoreId}",
+                    'info'
+                );
+                continue;
+            }
+
             // Ensure/merge a migration row for this product and target
             $migrationKey = [
                 'user_id'           => $userId,
@@ -326,64 +345,307 @@ class WixProductController extends Controller
         return back()->with($failed ? 'error' : 'success', $msg);
     }
 
+    public function syncProductSeoData(Request $request)
+    {
+        WixHelper::log('Product SEO Sync', 'Sync started', 'info');
+
+        $request->validate([
+            'from_store' => 'required|string',
+            'to_store'   => 'required|string|different:from_store',
+        ]);
+
+        $fromStore = $request->from_store;
+        $toStore   = $request->to_store;
+        $userId    = Auth::id() ?: 1;
+
+        WixHelper::log(
+            'Product SEO Sync',
+            "Input validated | from={$fromStore} | to={$toStore} | user={$userId}",
+            'debug'
+        );
+
+        $fromToken = WixHelper::getAccessToken($fromStore);
+        $toToken   = WixHelper::getAccessToken($toStore);
+
+        if (!$fromToken || !$toToken) {
+            WixHelper::log('Product SEO Sync', 'Missing access token(s)', 'error');
+            return back()->with('error', 'Missing Wix access token(s).');
+        }
+
+        $rows = \App\Models\WixProductMigration::where([
+            'user_id'       => $userId,
+            'from_store_id' => $fromStore,
+            'to_store_id'   => $toStore,
+            'status'        => 'success',
+        ])->whereNotNull('destination_product_id')->get();
+
+        WixHelper::log(
+            'Product SEO Sync',
+            "Total products to sync: {$rows->count()}",
+            'info'
+        );
+
+        $updated = 0;
+        $failed  = 0;
+        $skipped = 0;
+        $titleIgnored = 0;
+
+        foreach ($rows as $row) {
+
+            WixHelper::log(
+                'Product SEO Sync',
+                "Processing product | source={$row->source_product_id} | dest={$row->destination_product_id}",
+                'debug'
+            );
+
+            try {
+                /* ===================== V1 FETCH ===================== */
+                $v1Resp = Http::withHeaders([
+                    'Authorization' => $fromToken,
+                ])->get(
+                    "https://www.wixapis.com/stores/v1/products/{$row->source_product_id}",
+                    ['includeMerchantSpecificData' => 'true']
+                );
+
+                WixHelper::log(
+                    'Product SEO Sync',
+                    "V1 fetch status={$v1Resp->status()}",
+                    $v1Resp->ok() ? 'debug' : 'error'
+                );
+
+                if (!$v1Resp->ok()) {
+                    throw new \Exception('V1 product fetch failed');
+                }
+
+                $v1Product = $v1Resp->json('product') ?? [];
+
+                /* ===================== MAP SEO ===================== */
+                $seoData = $this->mapV1ProductSeoToV3($v1Product);
+
+                if (!$seoData) {
+                    $skipped++;
+
+                    WixHelper::log(
+                        'Product SEO Sync',
+                        "SEO skipped | source={$row->source_product_id} | empty title/description",
+                        'warning'
+                    );
+                    continue;
+                }
+
+                WixHelper::log('Product SEO Sync', 'SEO mapped successfully', 'debug');
+
+                /* ===================== V3 FETCH ===================== */
+                $v3Resp = Http::withHeaders([
+                    'Authorization' => "Bearer {$toToken}",
+                ])->get(
+                    "https://www.wixapis.com/stores/v3/products/{$row->destination_product_id}"
+                );
+
+                WixHelper::log(
+                    'Product SEO Sync',
+                    "V3 fetch status={$v3Resp->status()}",
+                    $v3Resp->ok() ? 'debug' : 'error'
+                );
+
+                if (!$v3Resp->ok()) {
+                    throw new \Exception('V3 product fetch failed');
+                }
+
+                $v3Product = $v3Resp->json('product') ?? [];
+                $revision  = $v3Product['revision'] ?? null;
+
+                if (!$revision) {
+                    throw new \Exception('Missing V3 revision');
+                }
+
+                /* ===================== PATCH ===================== */
+                $payload = [
+                    'product' => [
+                        'id'       => $row->destination_product_id,
+                        'revision' => (string)$revision,
+                        'seoData'  => $seoData,
+                    ],
+                ];
+
+                WixHelper::log('Product SEO Sync', 'PATCH payload prepared', 'debug');
+
+                $patch = Http::withHeaders([
+                    'Authorization' => "Bearer {$toToken}",
+                    'Content-Type'  => 'application/json',
+                ])->patch(
+                    "https://www.wixapis.com/stores/v3/products/{$row->destination_product_id}",
+                    $payload
+                );
+
+                WixHelper::log(
+                    'Product SEO Sync',
+                    "PATCH response status={$patch->status()}",
+                    $patch->ok() ? 'success' : 'error'
+                );
+
+                if (!$patch->ok()) {
+                    throw new \Exception('PATCH failed: ' . substr($patch->body(), 0, 500));
+                }
+
+                /* ===================== VERIFY TITLE ===================== */
+                $verify = Http::withHeaders([
+                    'Authorization' => "Bearer {$toToken}",
+                ])->get(
+                    "https://www.wixapis.com/stores/v3/products/{$row->destination_product_id}"
+                );
+
+                if ($verify->ok()) {
+                    $expectedTitle = null;
+                    $actualTitle   = null;
+
+                    foreach ($seoData['tags'] as $t) {
+                        if ($t['type'] === 'title') {
+                            $expectedTitle = trim($t['children']);
+                            break;
+                        }
+                    }
+
+                    foreach ($verify->json('product.seoData.tags', []) as $t) {
+                        if (($t['type'] ?? '') === 'title') {
+                            $actualTitle = trim((string)($t['children'] ?? ''));
+                            break;
+                        }
+                    }
+
+                    if ($expectedTitle && $actualTitle !== $expectedTitle) {
+                        $titleIgnored++;
+
+                        WixHelper::log(
+                            'Product SEO Sync',
+                            "TITLE IGNORED | source={$row->source_product_id} | expected=\"{$expectedTitle}\" | actual=\"{$actualTitle}\"",
+                            'warning'
+                        );
+                    }
+                }
+
+                $updated++;
+
+            } catch (\Throwable $e) {
+                $failed++;
+
+                WixHelper::log(
+                    'Product SEO Sync',
+                    "Exception | source={$row->source_product_id} | error={$e->getMessage()}",
+                    'error'
+                );
+            }
+        }
+
+        /* ===================== SUMMARY ===================== */
+        WixHelper::log(
+            'Product SEO Sync',
+            "Completed | updated={$updated} | skipped={$skipped} | failed={$failed} | title_ignored={$titleIgnored}",
+            'info'
+        );
+
+        return back()->with(
+            $failed ? 'warning' : 'success',
+            "Product SEO sync completed. Updated={$updated}, Skipped={$skipped}, Failed={$failed}, TitleIgnored={$titleIgnored}"
+        );
+    }
+
+
+    protected function mapV1ProductSeoToV3(array $product): ?array
+    {
+        $tags = [];
+
+        $title = !empty(trim($product['seoTitle'] ?? ''))
+            ? $product['seoTitle']
+            : $this->extractSeoTag($product, 'title');
+
+        if ($title) {
+            $tags[] = [
+                'type'     => 'title',
+                'children' => trim($title),
+                'custom'   => false,
+                'disabled' => false,
+            ];
+        }
+
+        $description = !empty(trim($product['seoDescription'] ?? ''))
+            ? $product['seoDescription']
+            : $this->extractSeoMeta($product, 'description');
+
+        if ($description) {
+            $tags[] = [
+                'type'     => 'meta',
+                'props'    => [
+                    'name'    => 'description',
+                    'content' => trim($description),
+                ],
+                'children' => '',
+                'custom'   => false,
+                'disabled' => false,
+            ];
+        }
+
+        if (empty($tags)) return null;
+
+        return [
+            'tags'     => $tags,
+            'settings' => [
+                'preventAutoRedirect' => (bool)($product['seoData']['settings']['preventAutoRedirect'] ?? false),
+                'keywords'            => array_values($product['seoData']['settings']['keywords'] ?? []),
+            ],
+        ];
+    }
+
+    protected function extractSeoTag(array $product, string $type): ?string
+    {
+        foreach ($product['seoData']['tags'] ?? [] as $tag) {
+            if (($tag['type'] ?? '') === $type && !empty($tag['children'])) {
+                return (string)$tag['children'];
+            }
+        }
+        return null;
+    }
+
+    protected function extractSeoMeta(array $product, string $name): ?string
+    {
+        foreach ($product['seoData']['tags'] ?? [] as $tag) {
+            if (
+                ($tag['type'] ?? '') === 'meta'
+                && ($tag['props']['name'] ?? '') === $name
+                && !empty($tag['props']['content'])
+            ) {
+                return (string)$tag['props']['content'];
+            }
+        }
+        return null;
+    }
 
 
     // ========================================================= Manual Migrator =========================================================
     // =========================================================
     // Export PRODUCTS + INVENTORY
     // =========================================================
+
     public function export(WixStore $store)
     {
-        WixHelper::log('Export Products+Inventory', "Export started for store: $store->store_name", 'info');
+        WixHelper::log('Manual Export', "Export started for store: $store->store_name", 'info');
 
         $accessToken = WixHelper::getAccessToken($store->instance_id);
         if (!$accessToken) {
-            return response()->json(['error' => 'Could not get Wix access token.'], 401);
+            return back()->with('error', 'Could not get Wix access token.');
         }
 
-        // Get catalog version
+        $userId = Auth::id() ?? 1;
+        $fromStoreId = $store->instance_id;
+
+        // Detect catalog version
         $catalogVersion = WixHelper::getCatalogVersion($accessToken);
 
-        // Fetch all collections
-        $collectionIdToSlug = [];
-        try {
-            $catController = app(\App\Http\Controllers\WixCategoryController::class);
-            $collectionsArr = $catController->getCollectionsFromWix($accessToken);
+        // -------- Fetch ALL products (same as migrateAuto) --------
+        $allProductsResp = $this->getAllProducts($accessToken, $store);
+        $products = $allProductsResp['products'] ?? [];
 
-            foreach (($collectionsArr['collections'] ?? []) as $c) {
-                if (!empty($c['id']) && !empty($c['slug'])) {
-                    $collectionIdToSlug[$c['id']] = $c['slug'];
-                }
-            }
-            Log::debug('Wix export: collections', [
-                'count' => count($collectionIdToSlug),
-                'sample' => array_slice($collectionIdToSlug, 0, 3)
-            ]);
-        } catch (\Throwable $e) {
-            $collectionsResp = Http::withHeaders([
-                'Authorization' => $accessToken,
-                'Content-Type'  => 'application/json'
-            ])->post('https://www.wixapis.com/stores-reader/v1/collections/query', [
-                "paging" => ["limit" => 1000]
-            ]);
-            $collections = $collectionsResp->json('collections') ?? [];
-            foreach ($collections as $c) {
-                if (!empty($c['id']) && !empty($c['slug'])) {
-                    $collectionIdToSlug[$c['id']] = $c['slug'];
-                }
-            }
-            Log::debug('Wix export: collections fallback', [
-                'count' => count($collectionIdToSlug),
-                'sample' => array_slice($collectionIdToSlug, 0, 3),
-                'error' => $e->getMessage()
-            ]);
-        }
-
-        // Get all products
-        $productsResponse = $this->getAllProducts($accessToken, $store);
-        $products = $productsResponse['products'] ?? [];
-
-        // Get all inventory items (legacy map-by-SKU)
+        // -------- Fetch Inventory V1 (SKU → qty) --------
         $inventoryItems = $this->queryInventoryItems($accessToken)['inventoryItems'] ?? [];
         $skuInventoryMap = [];
         foreach ($inventoryItems as $inv) {
@@ -392,204 +654,156 @@ class WixProductController extends Controller
             }
         }
 
-        $userId = Auth::id() ?? 1;
-        $fromStoreId = $store->instance_id;
-
-        // Fetch brands + ribbons + infoSections + customizations (if V3)
-        $brands = $ribbons = $infoSections = $customizations = [];
-        if ($catalogVersion === 'V3_CATALOG') {
-            // --- BRANDS ---
-            $brandsResp = Http::withHeaders([
-                'Authorization' => $accessToken,
-                'Content-Type'  => 'application/json'
-            ])->post('https://www.wixapis.com/stores/v3/brands/query', [
-                'query' => ['cursorPaging' => ['limit' => 100]],
-                'fields' => [],
-            ]);
-            foreach ($brandsResp->json('brands') ?? [] as $brand) {
-                $brands[$brand['id']] = $brand;
+        // -------- Fetch Collections to attach slugs (same as migrateAuto) --------
+        $collectionIdToSlug = [];
+        try {
+             // $catController = app(\App\Http\Controllers\WixCategoryController::class);
+            $collectionsArr = $this->getCollectionsFromWixV1($accessToken);
+            // $catController = app(\App\Http\Controllers\WixCategoryController::class);
+            // $collectionsArr = $catController->getCollectionsFromWixV1($accessToken);
+            foreach (($collectionsArr['collections'] ?? []) as $c) {
+                if (!empty($c['id']) && !empty($c['slug'])) {
+                    $collectionIdToSlug[$c['id']] = $c['slug'];
+                }
             }
-
-            // --- RIBBONS ---
-            $ribbonsResp = Http::withHeaders([
+        } catch (\Throwable $e) {
+            $fallback = Http::withHeaders([
                 'Authorization' => $accessToken,
-                'Content-Type'  => 'application/json'
-            ])->post('https://www.wixapis.com/stores/v3/ribbons/query', [
-                'query' => ['cursorPaging' => ['limit' => 100]],
-                'fields' => [],
+                'Content-Type' => 'application/json'
+            ])->post('https://www.wixapis.com/stores-reader/v1/collections/query', [
+                "paging" => ["limit" => 1000]
             ]);
-            foreach ($ribbonsResp->json('ribbons') ?? [] as $ribbon) {
-                $ribbons[$ribbon['id']] = $ribbon;
-            }
-
-            // --- INFO SECTIONS ---
-            $infoSectionsResp = Http::withHeaders([
-                'Authorization' => $accessToken,
-                'Content-Type'  => 'application/json'
-            ])->post('https://www.wixapis.com/stores/v3/info-sections/query', [
-                'query' => ['cursorPaging' => ['limit' => 100]],
-                'fields' => [],
-            ]);
-            foreach ($infoSectionsResp->json('infoSections') ?? [] as $info) {
-                $infoSections[$info['id']] = $info;
-            }
-
-            // --- CUSTOMIZATIONS ---
-            $customizationsResp = Http::withHeaders([
-                'Authorization' => $accessToken,
-                'Content-Type'  => 'application/json'
-            ])->post('https://www.wixapis.com/stores/v3/customizations/query', [
-                'query' => ['cursorPaging' => ['limit' => 100]],
-                'fields' => [],
-            ]);
-            foreach ($customizationsResp->json('customizations') ?? [] as $cust) {
-                $customizations[$cust['id']] = $cust;
+            foreach (($fallback->json('collections') ?? []) as $c) {
+                if (!empty($c['id']) && !empty($c['slug'])) {
+                    $collectionIdToSlug[$c['id']] = $c['slug'];
+                }
             }
         }
 
-        foreach ($products as &$product) {
-            // Attach legacy inventory by SKU (quick)
-            $sku = $product['sku'] ?? null;
-            if ($sku && isset($skuInventoryMap[$sku])) {
-                $product['inventory'] = $skuInventoryMap[$sku];
+        // ---------- ENRICH PRODUCTS EXACTLY LIKE migrateAuto ----------
+        foreach ($products as &$p) {
+
+            // Attach legacy inventory by main SKU
+            if (!empty($p['sku']) && isset($skuInventoryMap[$p['sku']])) {
+                $inv = $skuInventoryMap[$p['sku']];
+                $p['stock'] = [
+                    'quantity' => $inv['quantity'] ?? null,
+                    'inStock'  => $inv['inStock'] ?? ((int) ($inv['quantity'] ?? 0) > 0)
+                ];
             }
 
-            // Query full variant details
-            $variants_full = [];
-            if (!empty($product['id'])) {
+            // Fetch FULL variants (V1 reader) → identical to migrateAuto
+            if (!empty($p['id'])) {
                 $variantResp = Http::withHeaders([
                     'Authorization' => $accessToken,
                     'Content-Type'  => 'application/json'
-                ])->post("https://www.wixapis.com/stores-reader/v1/products/{$product['id']}/variants/query", [
+                ])->post("https://www.wixapis.com/stores-reader/v1/products/{$p['id']}/variants/query", [
                     "includeMerchantSpecificData" => true
                 ]);
-                $variants_full = $variantResp->json('variants') ?? [];
-            }
+                $variantsFull = $variantResp->json('variants') ?? [];
 
-            // Attach legacy inventory per variant by SKU
-            if ($variants_full) {
-                foreach ($variants_full as &$v) {
-                    $vSku = $v['variant']['sku'] ?? null;
-                    if ($vSku && isset($skuInventoryMap[$vSku])) {
-                        $v['inventory'] = $skuInventoryMap[$vSku];
+                // Attach inventory by SKU
+                foreach ($variantsFull as &$vf) {
+                    $flatSku = $vf['variant']['sku'] ?? $vf['sku'] ?? null;
+                    if ($flatSku && isset($skuInventoryMap[$flatSku])) {
+                        $inv = $skuInventoryMap[$flatSku];
+                        $vf['stock'] = [
+                            'quantity' => $inv['quantity'] ?? null,
+                            'inStock'  => $inv['inStock'] ?? ((int) ($inv['quantity'] ?? 0) > 0)
+                        ];
                     }
                 }
-                unset($v);
-                $product['variants_full'] = $variants_full;
+                unset($vf);
+
+                if ($variantsFull) {
+                    $p['variants_full'] = $variantsFull;
+                }
             }
 
-            // ------- NEW: v2 inventory enrichment (per product/variant) -------
+            // -------- Inventory V2 enrichment (same as auto) --------
             try {
-                $inventoryItemId = $product['inventoryItemId'] ?? null;
-                if (!$inventoryItemId && !empty($product['id'])) {
-                    $inventoryItemId = $this->findInventoryItemIdByProductId($accessToken, $product['id']);
+                $inventoryItemId = $p['inventoryItemId'] ?? null;
+                if (!$inventoryItemId && !empty($p['id'])) {
+                    $inventoryItemId = $this->findInventoryItemIdByProductId($accessToken, $p['id']);
                 }
 
                 if ($inventoryItemId) {
                     $invFull = $this->getInventoryVariantsV2($accessToken, $inventoryItemId);
+
                     if (!empty($invFull['inventoryItem'])) {
-                        $product['inventoryItem_full'] = $invFull['inventoryItem'];
+                        $p['inventoryItem_full'] = $invFull['inventoryItem'];
 
                         $byVarId = [];
                         foreach (($invFull['inventoryItem']['variants'] ?? []) as $iv) {
-                            if (!empty($iv['variantId'])) $byVarId[$iv['variantId']] = $iv;
+                            if (!empty($iv['variantId'])) {
+                                $byVarId[$iv['variantId']] = $iv;
+                            }
                         }
 
-                        if (!empty($product['variants_full'])) {
-                            foreach ($product['variants_full'] as &$v) {
-                                $vid = $v['id'] ?? ($v['variant']['id'] ?? null) ?? ($v['variantId'] ?? null);
+                        if (!empty($p['variants_full'])) {
+                            foreach ($p['variants_full'] as &$vf) {
+                                $vid = $vf['id'] ?? ($vf['variant']['id'] ?? null);
                                 if ($vid && isset($byVarId[$vid])) {
-                                    $v['inventory_v2'] = $byVarId[$vid];
-                                } elseif (($v['id'] ?? '00000000-0000-0000-0000-000000000000') === '00000000-0000-0000-0000-000000000000') {
-                                    $v['inventory_v2'] = ($invFull['inventoryItem']['variants'][0] ?? null);
+                                    $vf['inventory_v2'] = $byVarId[$vid];
                                 }
                             }
-                            unset($v);
                         } else {
-                            $product['singleVariant_inventory_v2'] = $invFull['inventoryItem']['variants'][0] ?? null;
+                            $p['singleVariant_inventory_v2'] =
+                                $invFull['inventoryItem']['variants'][0] ?? null;
                         }
                     }
                 }
+
             } catch (\Throwable $e) {
-                Log::warning('Wix export: inventory variants enrichment failed', ['error' => $e->getMessage()]);
-            }
-            // ------------------------------------------------------------------
-
-            // Add collectionSlugs array for this product
-            $product['collectionSlugs'] = [];
-            if (!empty($product['collectionIds']) && is_array($product['collectionIds'])) {
-                foreach ($product['collectionIds'] as $colId) {
-                    if (isset($collectionIdToSlug[$colId])) {
-                        $product['collectionSlugs'][] = $collectionIdToSlug[$colId];
-                    }
-                }
+                WixHelper::log('Manual Export', 'Inventory V2 enrichment failed: '.$e->getMessage(), 'warning');
             }
 
-            // --- Export extras for V3 ---
-            if ($catalogVersion === 'V3_CATALOG') {
-                if (!empty($product['brand']['id']) && isset($brands[$product['brand']['id']])) {
-                    $product['brand_export'] = $brands[$product['brand']['id']];
-                    if (empty($product['brand']['name']) && !empty($brands[$product['brand']['id']]['name'])) {
-                        $product['brand']['name'] = $brands[$product['brand']['id']]['name'];
-                    }
-                }
-                if (!empty($product['ribbon']['id']) && isset($ribbons[$product['ribbon']['id']])) {
-                    $product['ribbon_export'] = $ribbons[$product['ribbon']['id']];
-                }
-                if (!empty($product['infoSections'])) {
-                    $product['infoSections_export'] = [];
-                    foreach ($product['infoSections'] as $info) {
-                        $id = is_array($info) ? $info['id'] ?? $info : $info;
-                        if ($id && isset($infoSections[$id])) {
-                            $product['infoSections_export'][] = $infoSections[$id];
-                        }
-                    }
-                }
-                if (!empty($product['customizations'])) {
-                    $product['customizations_export'] = [];
-                    foreach ($product['customizations'] as $cust) {
-                        $id = is_array($cust) ? $cust['id'] ?? $cust : $cust;
-                        if ($id && isset($customizations[$id])) {
-                            $product['customizations_export'][] = $customizations[$id];
-                        }
+            // -------- Add collection slugs --------
+            $p['collectionSlugs'] = [];
+            if (!empty($p['collectionIds'])) {
+                foreach ($p['collectionIds'] as $cid) {
+                    if (isset($collectionIdToSlug[$cid])) {
+                        $p['collectionSlugs'][] = $collectionIdToSlug[$cid];
                     }
                 }
             }
 
-            // Store migration info in DB
-            if (!empty($product['id'])) {
+            // -------- Store migration row exactly like migrateAuto --------
+            if (!empty($p['id'])) {
                 WixProductMigration::updateOrCreate(
                     [
                         'user_id'           => $userId,
                         'from_store_id'     => $fromStoreId,
                         'to_store_id'       => null,
-                        'source_product_id' => $product['id'],
+                        'source_product_id' => $p['id'],
                     ],
                     [
-                        'source_product_sku'  => $product['sku'] ?? null,
-                        'source_product_name' => $product['name'] ?? null,
+                        'source_product_sku'  => $p['sku'] ?? null,
+                        'source_product_name' => $p['name'] ?? null,
                         'status'              => 'pending',
                         'error_message'       => null,
                     ]
                 );
             }
         }
-        unset($product);
+        unset($p);
 
-        WixHelper::log('Export Products+Inventory', "Exported " . count($products) . " products with inventory and variants.", 'success');
-
-        return response()->streamDownload(function () use ($products, $store) {
-            echo json_encode([
-                'from_store_id' => $store->instance_id,
-                'products' => $products
-            ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
-        }, 'products_and_inventory.json', [
-            'Content-Type' => 'application/json'
-        ]);
+        // ---------- Final JSON output ----------
+        return response()->streamDownload(
+            function () use ($products, $store) {
+                echo json_encode([
+                    'from_store_id' => $store->instance_id,
+                    'products'      => $products,
+                ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+            },
+            "manual_export_products.json",
+            ['Content-Type' => 'application/json']
+        );
     }
 
 
-        /**
+
+    /**
      * Reader v2: POST /stores-reader/v2/inventoryItems/query
      * Returns ALL inventory items (handles pagination). You can also pass an optional $filter,
      * e.g. "productId='xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'".
@@ -668,82 +882,74 @@ class WixProductController extends Controller
     // =========================================================
     // Import PRODUCTS + INVENTORY
     // =========================================================
+
     public function import(Request $request, WixStore $store)
     {
         $accessToken = WixHelper::getAccessToken($store->instance_id);
         if (!$accessToken) {
-            WixHelper::log('Import Products+Inventory', 'Could not get Wix access token.', 'error');
             return back()->with('error', 'Could not get Wix access token.');
         }
 
         if (!$request->hasFile('products_json')) {
-            WixHelper::log('Import Products+Inventory', 'No file uploaded.', 'error');
             return back()->with('error', 'No file uploaded.');
         }
 
-        $file = $request->file('products_json');
-        $json = file_get_contents($file->getRealPath());
+        $json = file_get_contents($request->file('products_json')->getRealPath());
         $decoded = json_decode($json, true);
 
-        if (json_last_error() !== JSON_ERROR_NONE || !isset($decoded['from_store_id'], $decoded['products']) || !is_array($decoded['products'])) {
-            WixHelper::log('Import Products+Inventory', 'Invalid JSON structure.', 'error');
-            return back()->with('error', 'Invalid JSON structure. Required keys: from_store_id and products.');
+        if (!isset($decoded['from_store_id'], $decoded['products'])) {
+            return back()->with('error', 'Invalid JSON structure.');
         }
 
-        $fromStoreId = $decoded['from_store_id'];
         $products = $decoded['products'];
-
-        usort($products, function ($a, $b) {
-            $dateA = isset($a['createdDate']) ? strtotime($a['createdDate']) : 0;
-            $dateB = isset($b['createdDate']) ? strtotime($b['createdDate']) : 0;
-            return $dateA <=> $dateB;
-        });
-
-        $catalogVersion = WixHelper::getCatalogVersion($accessToken);
-
-        $imported = 0;
-        $inventoryUpdated = 0;
-        $errors = [];
-
-        $collectionSlugMap = [];
+        $fromStoreId = $decoded['from_store_id'];
+        $toStoreId = $store->instance_id;
         $userId = Auth::id() ?? 1;
 
-        // pass $accessToken so we can pre-cache destination brands for dedupe
-        $relationMaps = $this->prepareRelationMaps($catalogVersion, $fromStoreId, $store->instance_id, $accessToken);
+        // Ensure sorting oldest → newest
+        usort($products, fn($a, $b) =>
+            strtotime($a['createdDate'] ?? 0) <=> strtotime($b['createdDate'] ?? 0)
+        );
+
+        // Prepare relations exactly like auto migration
+        $catalogVersion = WixHelper::getCatalogVersion($accessToken);
+        $relationMaps = $this->prepareRelationMaps($catalogVersion, $fromStoreId, $toStoreId, $accessToken);
+
+        $summary = [
+            'imported'         => 0,
+            'inventoryUpdated' => 0,
+            'failed'           => 0,
+        ];
 
         foreach ($products as $product) {
+
+            // Call same importer auto uses
             [$result, $error] = $this->importSingleProduct(
                 $catalogVersion,
                 $accessToken,
                 $product,
                 $fromStoreId,
-                $store->instance_id,
+                $toStoreId,
                 $userId,
                 $relationMaps,
-                $collectionSlugMap
+                $collectionSlugMap = []
             );
 
-            if ($result['imported']) $imported++;
-            if ($result['inventoryUpdated']) $inventoryUpdated++;
-            if ($result['error']) $errors[] = $result['error'];
+            if ($result['imported']) {
+                $summary['imported']++;
+                $summary['inventoryUpdated'] += (int)$result['inventoryUpdated'];
+            } else {
+                $summary['failed']++;
+            }
         }
 
-        if ($imported > 0) {
-            WixHelper::log('Import Products+Inventory', [
-                'imported' => $imported,
-                'inventoryUpdated' => $inventoryUpdated,
-                'errors' => $errors
-            ], count($errors) ? 'error' : 'success');
-            return back()->with('success', "$imported product(s) imported. $inventoryUpdated inventory item(s) created.");
-        } else {
-            WixHelper::log('Import Products+Inventory', [
-                'imported' => $imported,
-                'inventoryUpdated' => $inventoryUpdated,
-                'errors' => $errors
-            ], 'error');
-            return back()->with('error', 'No products imported. Errors: ' . implode("; ", $errors));
-        }
+        $msg = "Imported={$summary['imported']}, Inventory={$summary['inventoryUpdated']}, Failed={$summary['failed']}";
+
+        return $summary['imported'] > 0
+            ? back()->with('success', $msg)
+            : back()->with('error', $msg);
     }
+
 
     // =========================================================
     // Utility
@@ -3142,6 +3348,20 @@ class WixProductController extends Controller
         ];
     }
     
+    protected function getCollectionsFromWixV1(string $accessToken): array
+    {
+        // Mirrors: POST https://www.wixapis.com/stores/v1/collections/query
+        $body = ['query' => new \stdClass()];
+
+        $response = Http::withHeaders([
+            'Authorization' => $accessToken,
+            'Content-Type'  => 'application/json'
+        ])->post('https://www.wixapis.com/stores/v1/collections/query', $body);
+
+        WixHelper::log('Export Product Categories', 'Wix API response received for collections query (V1).', 'debug');
+
+        return $response->json() ?: [];
+    }
 
 
     // --- SKU utilities ---

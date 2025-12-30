@@ -126,10 +126,18 @@
                         </span>
                       </li>
                       {{-- 9. Media --}}
-                      <li class="step-item flex items-center shrink-0 snap-start sm:flex-1" data-step="9">
+                      <li class="step-item flex items-center shrink-0 snap-start sm:flex-1 sm:after:content-[''] sm:after:flex-1 sm:after:h-1
+                                 sm:after:border-b sm:after:border-gray-200 dark:sm:after:border-gray-700 sm:after:mx-3" data-step="9">
                         <span class="flex items-center">
                           <span class="step-dot w-7 h-7 mr-2 text-xs flex items-center justify-center rounded-full bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-300">9</span>
                           <span class="step-label whitespace-nowrap">Media</span>
+                        </span>
+                      </li>
+                      {{-- 10. Back in stock --}}
+                      <li class="step-item flex items-center shrink-0 snap-start sm:flex-1" data-step="10">
+                        <span class="flex items-center">
+                          <span class="step-dot w-7 h-7 mr-2 text-xs flex items-center justify-center rounded-full bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-300">10</span>
+                          <span class="step-label whitespace-nowrap">Back in Stock</span>
                         </span>
                       </li>
                     </ol>
@@ -161,6 +169,9 @@
                     </section>
                     <section class="step-panel hidden" data-step="9">
                       @include('partials.auto-step-box', ['title' => 'Media', 'idx' => 9])
+                    </section>
+                    <section class="step-panel hidden" data-step="10">
+                      @include('partials.auto-step-box', ['title' => 'Back in Stock', 'idx' => 10])
                     </section>
                   </div>
                 </div>
@@ -256,10 +267,18 @@
                         </span>
                       </li>
                       {{-- 9. Media --}}
-                      <li class="step-item flex items-center shrink-0 snap-start sm:flex-1" data-step="9">
+                      <li class="step-item flex items-center shrink-0 snap-start sm:flex-1 sm:after:content-[''] sm:after:flex-1 sm:after:h-1
+                                 sm:after:border-b sm:after:border-gray-200 dark:sm:after:border-gray-700 sm:after:mx-3" data-step="9">
                         <span class="flex items-center">
                           <span class="step-dot w-7 h-7 mr-2 text-xs flex items-center justify-center rounded-full bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-300">9</span>
                           <span class="step-label whitespace-nowrap">Media</span>
+                        </span>
+                      </li>
+                      {{-- 10. Back in stock --}}
+                      <li class="step-item flex items-center shrink-0 snap-start sm:flex-1" data-step="10">
+                        <span class="flex items-center">
+                          <span class="step-dot w-7 h-7 mr-2 text-xs flex items-center justify-center rounded-full bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-300">10</span>
+                          <span class="step-label whitespace-nowrap">Back in Stock</span>
                         </span>
                       </li>
                     </ol>
@@ -291,6 +310,9 @@
                     </section>
                     <section class="step-panel hidden" data-step="9">
                       @include('partials.step-box', ['title' => 'Media', 'idx' => 9])
+                    </section>
+                    <section class="step-panel hidden" data-step="10">
+                      @include('partials.step-box', ['title' => 'Back in Stock', 'idx' => 10])
                     </section>
                   </div>
                 </div>

@@ -4,6 +4,7 @@ use App\Http\Controllers\HomeController;
 use App\Http\Controllers\WixController;
 use App\Http\Controllers\ProfileController;
 use App\Http\Controllers\WixAutomaticMigrationController;
+use App\Http\Controllers\WixBackInStockController;
 use App\Http\Controllers\WixBrandController;
 use App\Http\Controllers\WixCatalogController;
 use App\Http\Controllers\WixCategoryController;
@@ -88,11 +89,16 @@ Route::middleware('auth')->group(function () {
 
     // Category Migration Routes
     Route::post('/wix/categories/auto-migrate', [WixCategoryController::class, 'migrateAuto'])->name('wix.migrate.categories');
+    Route::post('/wix/categories/sync-seo', [WixCategoryController::class, 'syncSeoData'])->name('wix.categories.syncSeo');
+
     Route::get('/wix/{store}/export-categories', [WixCategoryController::class, 'export'])->name('wix.export.categories');
     Route::post('/wix/{store}/import-categories', [WixCategoryController::class, 'import'])->name('wix.import.categories');
+    
 
     // Products Migration Routes
     Route::post('/wix/products/auto-migrate', [WixProductController::class, 'migrateAuto'])->name('wix.migrate.products');
+    Route::post('/wix/products/sync-seo', [WixProductController::class, 'syncProductSeoData'])->name('wix.products.syncSeo');
+
     Route::get('/wix/{store}/export-products', [WixProductController::class, 'export'])->name('wix.export.products');
     Route::post('/wix/{store}/import-products', [WixProductController::class, 'import'])->name('wix.import.products');
 
@@ -111,8 +117,8 @@ Route::middleware('auth')->group(function () {
     )->name('wix.contacts.cleanup.orphans');
 
     // Members Migration Routes
-    Route::get('/wix/{store}/export-members', [WixMemberMigrationController::class, 'export'])->name('wix.export.members');
-    Route::post('/wix/{store}/import-members', [WixMemberMigrationController::class, 'import'])->name('wix.import.members');
+    // Route::get('/wix/{store}/export-members', [WixMemberMigrationController::class, 'export'])->name('wix.export.members');
+    // Route::post('/wix/{store}/import-members', [WixMemberMigrationController::class, 'import'])->name('wix.import.members');
 
     // Orders Migration Routes
     Route::post('/wix/orders/auto-migrate', [WixOrderController::class, 'migrateAuto'])->name('wix.migrate.orders');
@@ -140,7 +146,10 @@ Route::middleware('auth')->group(function () {
     Route::post('/wix/{store}/loyalty-import', [WixLoyaltyAccountController::class, 'import'])->name('wix.loyalty.import');
 
 
-
+    // Back in Stock Migration Routes
+    Route::post('/wix/back-in-stock/auto-migrate', [WixBackInStockController::class, 'migrateAuto'])->name('wix.migrate.back.in.stock');
+    Route::get('/wix/{store}/back-in-stock-export', [WixBackInStockController::class, 'export'])->name('wix.export.back.in.stock');
+    Route::post('/wix/{store}/back-in-stock-import', [WixBackInStockController::class, 'import'])->name('wix.import.back.in.stock');
 
 });
 
