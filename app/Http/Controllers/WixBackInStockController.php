@@ -2,17 +2,16 @@
 
 namespace App\Http\Controllers;
 
-use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Facades\Auth;
-use App\Models\WixStore;
 use App\Helpers\WixHelper;
+use App\Models\WixProductMigration;
+use App\Models\WixStore;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Http;
 
 class WixBackInStockController extends Controller
 {
-    // ======================================================================
-    // AUTO MIGRATE
-    // ======================================================================
     public function migrateAuto(Request $request)
     {
         $request->validate([
@@ -20,324 +19,488 @@ class WixBackInStockController extends Controller
             'to_store'   => 'required|string|different:from_store',
         ]);
 
-        $fromId = $request->input('from_store');
-        $toId   = $request->input('to_store');
+        $fromStoreId = $request->from_store;
+        $toStoreId   = $request->to_store;
 
-        $from = WixStore::where('instance_id', $fromId)->first();
-        $to   = WixStore::where('instance_id', $toId)->first();
+        WixHelper::log('BIS IMPORT', "Auto migrate {$fromStoreId} → {$toStoreId}", 'info');
 
-        $fromLabel = $from?->store_name ?: $fromId;
-        $toLabel   = $to?->store_name   ?: $toId;
-
-        WixHelper::log('Auto BIS Migration', "===== START {$fromLabel} → {$toLabel} =====", 'info');
-
-        $fromToken = WixHelper::getAccessToken($fromId);
-        $toToken   = WixHelper::getAccessToken($toId);
+        $fromToken = WixHelper::getAccessToken($fromStoreId);
+        $toToken   = WixHelper::getAccessToken($toStoreId);
 
         if (!$fromToken || !$toToken) {
-            WixHelper::log('Auto BIS Migration', "Missing token(s) from={$fromId} to={$toId}", 'error');
-            return back()->with('error', 'Could not obtain Wix access token(s).');
+            return back()->with('error', 'Missing Wix token.');
         }
 
-        WixHelper::log('Auto BIS Migration', "Tokens loaded successfully", 'debug');
-
-        // FETCH
-        $list = $this->fetchBackInStock($fromToken);
-
-        if (!is_array($list)) {
-            WixHelper::log('Auto BIS Migration', "[FETCH FAILED] response was not array", 'error');
-            return back()->with('error', 'Failed to fetch Back-In-Stock requests');
+        $rows = $this->fetchBackInStock($fromToken);
+        if (!is_array($rows)) {
+            return back()->with('error', 'Failed to fetch BIS data.');
         }
 
-        $total = count($list);
-        WixHelper::log('Auto BIS Migration', "Fetched {$total} BIS requests", 'info');
-
-        $imported = 0;
+        $created  = 0;
+        $existing = 0;
+        $skipped  = 0;
         $failed   = 0;
 
-        foreach ($list as $req) {
-
-            WixHelper::log('Auto BIS Migration', "Processing source request: ".json_encode($req), 'debug');
-
-            $payload = $this->buildCreatePayload($req);
+        foreach ($rows as $row) {
+            $payload = $this->buildCreatePayload(
+                $row,
+                $toToken,
+                $fromStoreId,
+                $toStoreId
+            );
 
             if (!$payload) {
-                $failed++;
-                WixHelper::log('Auto BIS Migration', "Invalid payload built for request: ".json_encode($req), 'error');
+                $skipped++;
                 continue;
             }
 
-            WixHelper::log('Auto BIS Migration', "Built payload: ".json_encode($payload), 'debug');
-
             $result = $this->createBackInStock($toToken, $payload);
+            $http   = $result['http_status'];
+            $body   = $result['body'] ?? [];
 
-            WixHelper::log('Auto BIS Migration', "Create API Response: ".json_encode($result), 'debug');
+            $code = data_get($body, 'details.applicationError.code');
+            $auth = data_get($body, 'details.failed-client.options.authority');
 
-            if (isset($result['request']['id'])) {
-                $imported++;
-                WixHelper::log('Auto BIS Migration', "✔ Created BIS ID: ".$result['request']['id'], 'success');
-            } else {
-                $failed++;
-                WixHelper::log(
-                    'Auto BIS Migration',
-                    "Create failed. Payload=".json_encode($payload)." Response=".json_encode($result),
-                    'error'
-                );
+            // REAL CREATE
+            if ($http === 200 || $http === 201) {
+                $created++;
+                continue;
             }
+
+            // ALREADY EXISTS
+            if ($code === 'BACK_IN_STOCK_NOTIFICATION_REQUEST_ALREADY_EXISTS') {
+                $existing++;
+                WixHelper::log('BIS IMPORT', 'Already exists – no action needed', 'info');
+                continue;
+            }
+
+            // CONTACT SERVICE FAILURE => SKIP
+            if (
+                $http === 403 &&
+                $auth === 'com.wixpress.contacts.contacts-allocator-proxy'
+            ) {
+                $skipped++;
+                WixHelper::log('BIS IMPORT', 'Contacts allocator error – skipped', 'warn');
+                continue;
+            }
+
+            // REAL FAILURE
+            $failed++;
+            WixHelper::log('BIS IMPORT', 'Create failed: ' . json_encode($body), 'error');
         }
 
-        WixHelper::log('Auto BIS Migration', "===== FINISHED imported={$imported} failed={$failed} =====", $failed ? 'warn' : 'success');
-
-        return back()->with('success', "Back-in-Stock migration completed. Imported={$imported}, Failed={$failed}.");
+        return back()->with(
+            'success',
+            "Created={$created}, Existing={$existing}, Skipped={$skipped}, Failed={$failed}"
+        );
     }
 
-    // ======================================================================
-    // EXPORT
-    // ======================================================================
     public function export(WixStore $store)
     {
         $storeId = $store->instance_id;
-
-        WixHelper::log('Export BIS', "===== START EXPORT for {$store->store_name} ({$storeId}) =====", 'info');
-
-        $token = WixHelper::getAccessToken($storeId);
+        $token   = WixHelper::getAccessToken($storeId);
 
         if (!$token) {
-            WixHelper::log('Export BIS', "Access token missing for store {$storeId}", 'error');
             return back()->with('error', 'Access denied.');
         }
 
-        $list = $this->fetchBackInStock($token);
-
-        if (!is_array($list)) {
-            WixHelper::log('Export BIS', "Fetch failed (returned non-array)", 'error');
-            return back()->with('error', 'Wix API error.');
+        $rows = $this->fetchBackInStock($token);
+        if (!is_array($rows)) {
+            return back()->with('error', 'Failed to fetch BIS data.');
         }
 
-        WixHelper::log('Export BIS', "Fetched ".count($list)." BIS records", 'success');
+        foreach ($rows as &$row) {
+            $productId = data_get($row, 'catalogReference.catalogItemId');
+            if (!$productId) {
+                continue;
+            }
+
+            $product = $this->fetchProductReader($token, $productId);
+            if (!$product) {
+                continue;
+            }
+
+            $row['_product'] = [
+                'name'  => data_get($product, 'name'),
+                'price' => data_get($product, 'priceData.price'),
+                'url'   => data_get($product, 'productPageUrl'),
+                'image' => [
+                    'url' => data_get($product, 'media.mainMedia.image.url'),
+                    'id'  => data_get($product, 'media.mainMedia.id'),
+                ],
+            ];
+        }
 
         return response()->streamDownload(
-            function () use ($list, $storeId) {
-                echo json_encode([
-                    'meta' => [
-                        'from_store_id' => $storeId,
-                        'generated_at'  => now()->toIso8601String(),
-                    ],
-                    'back_in_stock_requests' => $list,
-                ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
-            },
+            fn () => print json_encode([
+                'meta' => [
+                    'from_store_id' => $storeId,
+                    'generated_at'  => now()->toIso8601String(),
+                ],
+                'back_in_stock_requests' => $rows,
+            ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE),
             'back_in_stock_requests.json',
             ['Content-Type' => 'application/json']
         );
     }
 
-    // ======================================================================
-    // MANUAL IMPORT
-    // ======================================================================
     public function import(Request $request, WixStore $store)
     {
-        WixHelper::log('Manual BIS Import', "===== START MANUAL IMPORT ({$store->store_name}) =====", 'info');
+        $toStoreId = $store->instance_id;
+        $token     = WixHelper::getAccessToken($toStoreId);
 
-        $token = WixHelper::getAccessToken($store->instance_id);
         if (!$token) {
-            WixHelper::log('Manual BIS Import', "Missing access token", 'error');
             return back()->with('error', 'Token missing.');
         }
 
-        if (!$request->hasFile('back_in_stock_json')) {
-            WixHelper::log('Manual BIS Import', "No uploaded file", 'error');
-            return back()->with('error', 'No file uploaded.');
-        }
+        $decoded = json_decode(
+            file_get_contents($request->file('back_in_stock_json')->getRealPath()),
+            true
+        );
 
-        $json = file_get_contents($request->file('back_in_stock_json')->getRealPath());
-        WixHelper::log('Manual BIS Import', "Uploaded JSON: ".$json, 'debug');
-
-        $decoded = json_decode($json, true);
-
-        if (!is_array($decoded)) {
-            WixHelper::log('Manual BIS Import', "Invalid JSON", 'error');
-            return back()->with('error', 'Invalid JSON file.');
-        }
-
-        $rows = $decoded['back_in_stock_requests'] ?? $decoded['requests'] ?? null;
-
+        $rows = $decoded['back_in_stock_requests'] ?? null;
         if (!is_array($rows)) {
-            WixHelper::log('Manual BIS Import', "Missing required key back_in_stock_requests", 'error');
-            return back()->with('error', 'Invalid structure: missing back_in_stock_requests.');
+            return back()->with('error', 'Invalid JSON.');
         }
 
-        $imported = 0;
+        WixHelper::log('BIS IMPORT', "Manual import start → {$toStoreId}", 'info');
+
+        $created  = 0;
+        $existing = 0;
+        $skipped  = 0;
         $failed   = 0;
 
-        foreach ($rows as $req) {
+        foreach ($rows as $row) {
+            $sourceProductId = data_get($row, 'catalogReference.catalogItemId');
 
-            WixHelper::log('Manual BIS Import', "Processing request: ".json_encode($req), 'debug');
+            $migration = WixProductMigration::query()
+                ->whereNotNull('destination_product_id')
+                ->where('to_store_id', $toStoreId)
+                ->where('source_product_id', $sourceProductId)
+                ->first();
 
-            $payload = $this->buildCreatePayload($req);
+            if (!$migration) {
+                WixHelper::log('BIS IMPORT', "No migration row for {$sourceProductId}", 'warn');
+                $skipped++;
+                continue;
+            }
+
+            $fromStoreId = $migration->from_store_id;
+
+            $payload = $this->buildCreatePayload(
+                $row,
+                $token,
+                $fromStoreId,
+                $toStoreId
+            );
+
             if (!$payload) {
-                $failed++;
-                WixHelper::log('Manual BIS Import', "Invalid payload produced from row: ".json_encode($req), 'error');
+                $skipped++;
                 continue;
             }
 
             $result = $this->createBackInStock($token, $payload);
+            $http   = $result['http_status'];
+            $body   = $result['body'] ?? [];
 
-            WixHelper::log('Manual BIS Import', "Create API Response: ".json_encode($result), 'debug');
+            $code = data_get($body, 'details.applicationError.code');
+            $auth = data_get($body, 'details.failed-client.options.authority');
 
-            if (isset($result['request']['id'])) {
-                $imported++;
-            } else {
-                $failed++;
-                WixHelper::log('Manual BIS Import', "Create failed: ".json_encode($result), 'error');
+            // REAL CREATE
+            if ($http === 200 || $http === 201) {
+                $created++;
+                continue;
             }
+
+            // ALREADY EXISTS
+            if ($code === 'BACK_IN_STOCK_NOTIFICATION_REQUEST_ALREADY_EXISTS') {
+                $existing++;
+                WixHelper::log('BIS IMPORT', 'Already exists – no action needed', 'info');
+                continue;
+            }
+
+            // CONTACT SERVICE FAILURE
+            if (
+                $http === 403 &&
+                $auth === 'com.wixpress.contacts.contacts-allocator-proxy'
+            ) {
+                $skipped++;
+                WixHelper::log('BIS IMPORT', 'Contacts allocator error – skipped', 'warn');
+                continue;
+            }
+
+            // REAL FAILURE
+            $failed++;
+            WixHelper::log('BIS IMPORT', 'Create failed: ' . json_encode($body), 'error');
         }
 
-        WixHelper::log('Manual BIS Import', "===== FINISHED imported={$imported} failed={$failed} =====", $failed ? 'warn' : 'success');
-
-        return back()->with('success', "{$imported} request(s) imported. Failed: {$failed}");
+        return back()->with(
+            'success',
+            "Created={$created}, Existing={$existing}, Skipped={$skipped}, Failed={$failed}"
+        );
     }
 
-    // ======================================================================
-    // FETCH FROM WIX
-    // ======================================================================
-    private function fetchBackInStock(string $token)
+    private function fetchBackInStock(string $token): ?array
     {
-        $ensureBearer = fn($t) => (stripos($t, 'Bearer') === 0 ? $t : "Bearer {$t}");
+        $resp = Http::withHeaders([
+            'Authorization' => str_starts_with($token, 'Bearer') ? $token : "Bearer {$token}",
+            'Content-Type'  => 'application/json',
+        ])->post(
+            'https://www.wixapis.com/back-in-stock-service/v1/back-in-stock-notification-requests/query',
+            ['query' => new \stdClass()]
+        );
 
-        $url  = 'https://www.wixapis.com/back-in-stock-service/v1/back-in-stock-notification-requests';
-        $all  = [];
-        $next = null;
+        return $resp->ok() ? ($resp->json()['requests'] ?? []) : null;
+    }
 
-        WixHelper::log('BIS Fetch', "===== FETCH START =====", 'info');
+    private function getPublishedSiteBaseUrl(string $token, string $storeId): ?string
+    {
+        $cacheKey = "wix:published-site-url:{$storeId}";
 
-        do {
-            $query = [
-                "query" => [
-                    "filter" => "{\"status\": \"RECEIVED\"}",
-                    "paging" => ["limit" => 200],
-                    "sort"   => "[{\"createdDate\": \"asc\"}]"
-                ]
-            ];
-
-            if ($next) {
-                $query['query']['paging']['cursor'] = $next;
-            }
-
-            WixHelper::log('BIS Fetch', "Sending query: ".json_encode($query), 'debug');
-
+        return Cache::remember($cacheKey, now()->addHours(6), function () use ($token) {
             $resp = Http::withHeaders([
-                'Authorization' => $ensureBearer($token),
-                'Content-Type' => 'application/json'
-            ])
-            ->withBody(json_encode($query), 'application/json')
-            ->post($url);
-
-            WixHelper::log(
-                'BIS Fetch',
-                "API Response status=".$resp->status()." body=".$resp->body(),
-                $resp->ok() ? 'debug' : 'error'
-            );
+                'Authorization' => str_starts_with($token, 'Bearer') ? $token : "Bearer {$token}",
+                'Content-Type'  => 'application/json',
+            ])->get('https://www.wixapis.com/urls-server/v2/published-site-urls');
 
             if (!$resp->ok()) {
                 return null;
             }
 
-            $json  = $resp->json();
-            $batch = $json['results'] ?? $json['backInStockNotificationRequests'] ?? [];
-
-            if (is_array($batch)) {
-                $all = array_merge($all, $batch);
+            $urls = $resp->json('urls', []);
+            foreach ($urls as $u) {
+                if (!empty($u['primary']) && !empty($u['url'])) {
+                    return rtrim((string) $u['url'], '/');
+                }
             }
 
-            $next = $json['pagingMetadata']['cursors']['next'] ?? null;
+            foreach ($urls as $u) {
+                if (!empty($u['url'])) {
+                    return rtrim((string) $u['url'], '/');
+                }
+            }
 
-        } while ($next);
-
-        WixHelper::log('BIS Fetch', "===== FETCH COMPLETE (".count($all)." total) =====", 'success');
-
-        return $all;
+            return null;
+        });
     }
 
-    // ======================================================================
-    // BUILD PAYLOAD
-    // ======================================================================
-    private function buildCreatePayload(array $src)
-    {
-        WixHelper::log('BIS Payload Builder', "Source data: ".json_encode($src), 'debug');
+    private function buildCreatePayload(
+        array $src,
+        string $toToken,
+        string $fromStoreId,
+        string $toStoreId
+    ): ?array {
+        $email = data_get($src, 'email');
+        $cat   = data_get($src, 'catalogReference');
 
-        $email = $src['email'] ?? $src['request']['email'] ?? null;
-        if (!$email) {
-            WixHelper::log('BIS Payload Builder', "Missing email", 'error');
+        if (!$email || !is_array($cat)) {
+            WixHelper::log('BIS IMPORT', 'Missing email/catalogReference', 'warn');
             return null;
         }
 
-        $cat = $src['catalogReference'] ?? $src['request']['catalogReference'] ?? null;
-        if (!$cat) {
-            WixHelper::log('BIS Payload Builder', "Missing catalogReference", 'error');
+        $sourceProductId = data_get($cat, 'catalogItemId');
+        $appId           = data_get($cat, 'appId');
+
+        if (!$sourceProductId || !$appId) {
+            WixHelper::log('BIS IMPORT', 'Missing catalogItemId/appId', 'warn');
             return null;
         }
 
-        $name  = $src['itemDetails']['name']  ?? $src['name']  ?? null;
-        $price = $src['itemDetails']['price'] ?? null;
+        $migration = WixProductMigration::query()
+            ->where('from_store_id', $fromStoreId)
+            ->where('to_store_id', $toStoreId)
+            ->where('source_product_id', $sourceProductId)
+            ->whereNotNull('destination_product_id')
+            ->whereIn('status', ['success', 'completed'])
+            ->first();
 
-        if (!$name || !$price) {
-            WixHelper::log('BIS Payload Builder', "Missing itemDetails.name or itemDetails.price", 'error');
+        if (!$migration) {
+            WixHelper::log('BIS IMPORT', "No migration row for source_product_id={$sourceProductId}", 'warn');
             return null;
         }
 
-        $image = $src['itemDetails']['image'] ?? [];
-        $itemUrl = $src['itemUrl'] ?? $src['request']['itemUrl'] ?? "";
+        $destinationProductId = $migration->destination_product_id;
+
+        $srcOptions  = data_get($cat, 'options', []);
+        $variantId   = is_array($srcOptions) ? ($srcOptions['variantId'] ?? null) : null;
+        $zeroVariant = '00000000-0000-0000-0000-000000000000';
+
+        $optionsForCreate = new \stdClass();
+        if ($variantId && $variantId !== $zeroVariant) {
+            WixHelper::log('BIS IMPORT', "Variant mapping not supported (src variantId={$variantId})", 'warn');
+            $optionsForCreate = new \stdClass();
+        }
+
+        $itemDetails = null;
+        $itemUrl     = null;
+
+        $v3 = $this->fetchProductV3($toToken, $destinationProductId);
+
+        $extractPrice = function (?array $p): ?string {
+            if (!$p) return null;
+            $candidates = [
+                data_get($p, 'priceData.price'),
+                data_get($p, 'priceData.formatted.price'),
+                data_get($p, 'price.price'),
+                data_get($p, 'price.amount'),
+                data_get($p, 'price'),
+            ];
+            foreach ($candidates as $v) {
+                if ($v === null || $v === '') continue;
+                if (is_numeric($v)) return number_format((float) $v, 2, '.', '');
+                if (is_string($v)) return $v;
+            }
+            return null;
+        };
+
+        $extractImage = function (?array $p): ?array {
+            if (!$p) return null;
+
+            $url = data_get($p, 'media.mainMedia.image.url')
+                ?? data_get($p, 'media.mainMedia.thumbnail.url')
+                ?? data_get($p, 'media.main.image.url')
+                ?? data_get($p, 'media.main.image')
+                ?? data_get($p, 'media.mainMedia.url');
+
+            $id = data_get($p, 'media.mainMedia.id')
+                ?? data_get($p, 'media.main.id')
+                ?? data_get($p, 'media.mainMedia.image.id');
+
+            if (!$url && !$id) return null;
+
+            return [
+                'url' => $url,
+                'id'  => $id,
+            ];
+        };
+
+        if ($v3) {
+            $name  = data_get($v3, 'name');
+            $price = $extractPrice($v3);
+
+            if ($name || $price) {
+                $itemDetails = [
+                    'name'  => $name ?: 'Product',
+                    'price' => $price ?: '0.00',
+                ];
+
+                if ($img = $extractImage($v3)) {
+                    $itemDetails['image'] = $img;
+                }
+            }
+
+            $siteBaseUrl = $this->getPublishedSiteBaseUrl($toToken, $toStoreId);
+            $slug        = data_get($v3, 'slug');
+
+            if ($siteBaseUrl && $slug) {
+                $itemUrl = "{$siteBaseUrl}/product-page/{$slug}";
+            }
+        }
+
+        if (!$itemDetails && !empty($src['_product']) && is_array($src['_product'])) {
+            $snap = $src['_product'];
+
+            $snapPrice = $snap['price'] ?? null;
+            if (is_numeric($snapPrice)) {
+                $snapPrice = number_format((float) $snapPrice, 2, '.', '');
+            } elseif (!is_string($snapPrice)) {
+                $snapPrice = null;
+            }
+
+            $itemDetails = [
+                'name'  => $snap['name'] ?? 'Product',
+                'price' => $snapPrice ?: '0.00',
+            ];
+
+            if (!empty($snap['image']) && is_array($snap['image'])) {
+                $itemDetails['image'] = [
+                    'url' => $snap['image']['url'] ?? null,
+                    'id'  => $snap['image']['id'] ?? null,
+                ];
+            }
+
+            $snapUrl = $snap['url'] ?? null;
+            if (is_array($snapUrl)) {
+                $base = $snapUrl['base'] ?? '';
+                $path = $snapUrl['path'] ?? '';
+                $itemUrl = $base && $path ? rtrim($base, '/') . '/' . ltrim($path, '/') : null;
+            } elseif (is_string($snapUrl)) {
+                $itemUrl = $snapUrl;
+            }
+        }
+
+        if (!$itemDetails) {
+            WixHelper::log('BIS IMPORT', "No product details available for source_product_id={$sourceProductId}", 'warn');
+            return null;
+        }
 
         $payload = [
-            "request" => [
-                "email" => $email,
-                "catalogReference" => [
-                    "catalogItemId" => $cat['catalogItemId'] ?? null,
-                    "appId"         => $cat['appId'] ?? null,
-                    "options"       => $cat['options'] ?? [],
+            'itemDetails' => $itemDetails,
+            'request' => [
+                'email' => $email,
+                'catalogReference' => [
+                    'catalogItemId' => $destinationProductId,
+                    'appId'         => $appId,
+                    'options'       => $optionsForCreate,
                 ],
-                "itemUrl" => $itemUrl,
-                "itemDetails" => [
-                    "name"  => $name,
-                    "price" => $price,
-                    "image" => $image
-                ]
-            ]
+            ],
         ];
 
-        WixHelper::log('BIS Payload Builder', "Built payload: ".json_encode($payload), 'debug');
+        if ($itemUrl) {
+            $payload['request']['itemUrl'] = $itemUrl;
+        }
 
+        WixHelper::log('BIS IMPORT', 'Final BIS payload: ' . json_encode($payload), 'debug');
         return $payload;
     }
 
-    // ======================================================================
-    // CREATE REQUEST IN WIX
-    // ======================================================================
-    private function createBackInStock(string $token, array $payload)
+    private function fetchProductReader(string $token, string $productId): ?array
     {
-        WixHelper::log('BIS Create', "Sending create payload: ".json_encode($payload), 'debug');
+        $resp = Http::withHeaders([
+            'Authorization' => str_starts_with($token, 'Bearer') ? $token : "Bearer {$token}",
+            'Content-Type'  => 'application/json',
+        ])->get("https://www.wixapis.com/stores-reader/v1/products/{$productId}");
 
-        $headers = [
-            'Authorization' => (stripos($token, 'Bearer ') === 0 ? $token : 'Bearer '.$token),
-            'Content-Type'  => 'application/json'
-        ];
+        return $resp->ok() ? ($resp->json()['product'] ?? null) : null;
+    }
 
-        $resp = Http::withHeaders($headers)
-            ->withBody(json_encode($payload), 'application/json')
-            ->post("https://www.wixapis.com/back-in-stock-service/v1/back-in-stock-notification-request");
+    private function fetchProductV3(string $token, string $productId): ?array
+    {
+        $resp = Http::withHeaders([
+            'Authorization' => str_starts_with($token, 'Bearer') ? $token : "Bearer {$token}",
+            'Content-Type'  => 'application/json',
+        ])->get("https://www.wixapis.com/stores/v3/products/{$productId}");
+
+        return $resp->ok() ? ($resp->json()['product'] ?? null) : null;
+    }
+
+    private function createBackInStock(string $token, array $payload): array
+    {
+        $resp = Http::withHeaders([
+                'Authorization' => str_starts_with($token, 'Bearer') ? $token : "Bearer {$token}",
+                'Content-Type'  => 'application/json',
+            ])
+            ->timeout(20)
+            ->retry(3, 400, function ($e) {
+                return $e instanceof ConnectionException;
+            }, throw: false)
+            ->post(
+                'https://www.wixapis.com/back-in-stock-service/v1/back-in-stock-notification-requests',
+                $payload
+            );
+
+        $body = $resp->json();
 
         WixHelper::log(
-            'BIS Create',
-            "Response status=".$resp->status()." body=".$resp->body(),
-            $resp->ok() ? 'success' : 'error'
+            'BIS IMPORT',
+            'Create response status=' . $resp->status() . ' body=' . json_encode($body),
+            $resp->ok() ? 'debug' : 'error'
         );
 
-        return $resp->json();
+        return [
+            'http_status' => $resp->status(),
+            'ok'          => $resp->ok(),
+            'body'        => $body,
+        ];
     }
 }
-
-
-// curl -v -X GET "https://www.wixapis.com/back-in-stock-service/v1/back-in-stock-notification-requests" \
-//   -H "Content-Type: application/json" \
-//   -H "Authorization: <AUTH>" \
-//   --data-binary '{"query":{}}'
