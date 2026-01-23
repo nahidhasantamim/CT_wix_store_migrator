@@ -16,6 +16,7 @@ class WixProductMigration extends Model
         'destination_product_id',
         'status',
         'error_message',
+        'message'
     ];
 
     // Relationships

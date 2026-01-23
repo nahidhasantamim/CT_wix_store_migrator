@@ -4,19 +4,15 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Auth;
-
 use App\Models\WixStore;
 use App\Helpers\WixHelper;
-
 use App\Models\WixProductMigration;
 use App\Models\WixBrandMigration;
 use App\Models\WixCollectionMigration;
 use App\Models\WixRibbonMigration;
 use App\Models\WixCustomizationMigration;
 use App\Models\WixInfoSectionMigration;
-use Illuminate\Support\Facades\DB;
 
 class WixProductController extends Controller
 {
@@ -85,7 +81,7 @@ class WixProductController extends Controller
         $module = $request->input('module', 'products');
         \App\Helpers\WixHelper::log('Auto Products', "BEGIN [$module/$step]: {$from->store_name} → {$to->store_name}", 'info');
 
-        // Reuse your existing pipeline (unchanged)
+        // Reuse your existing pipeline 
         return $this->migrator($request, $from, $to);
     }
 
@@ -258,53 +254,162 @@ class WixProductController extends Controller
             $sourceId  = $product['id'] ?? null;
             $sourceSku = $product['sku'] ?? null;
 
-            // =========================================================
-            // NEW: Skip if this product was already successfully
-            // migrated to THIS destination store
-            // =========================================================
-            $alreadyMigrated = \App\Models\WixProductMigration::where('source_product_id', $sourceId)
-                ->where('to_store_id', $toStoreId)
-                ->where('status', 'success')
-                ->exists();
-
-            if ($alreadyMigrated) {
-                $skipped++;
-                WixHelper::log(
-                    'Auto Products',
-                    "SKIP: Product {$sourceId} already migrated to store {$toStoreId}",
-                    'info'
-                );
-                continue;
-            }
-
-            // Ensure/merge a migration row for this product and target
-            $migrationKey = [
+            // Base selector for existing migration rows
+            $migrationBase = [
                 'user_id'           => $userId,
                 'from_store_id'     => $fromStoreId,
                 'to_store_id'       => $toStoreId,
                 'source_product_id' => $sourceId,
             ];
-            \App\Models\WixProductMigration::updateOrCreate(
-                $migrationKey,
-                [
-                    'source_product_sku'   => $sourceSku,
-                    'source_product_name'  => $product['name'] ?? null,
-                    'status'               => 'pending',
-                    'error_message'        => null,
-                    'destination_product_id' => null,
-                ]
-            );
+
+            // Latest successful migration (if any)
+            $latestSuccess = \App\Models\WixProductMigration::where($migrationBase)
+                ->where('status', 'success')
+                ->orderByDesc('id')
+                ->first();
+
+            // Always attempt to attach SEO data from source V1 (same pattern as sync)
+            try {
+                if ($sourceId) {
+                    $v1Resp = Http::withHeaders([
+                        'Authorization' => $fromToken,
+                    ])->get(
+                        "https://www.wixapis.com/stores-reader/v1/products/{$sourceId}",
+                        ['includeMerchantSpecificData' => 'true']
+                    );
+                    if ($v1Resp->ok()) {
+                        $v1Product = $v1Resp->json('product') ?? [];
+                        $seoData = $this->mapV1ProductSeoToV3($v1Product);
+                        if ($seoData) {
+                            $product['seoData'] = $seoData;
+                        }
+                    } else {
+                        WixHelper::log('Auto Products', "SEO fetch failed for {$sourceId}: {$v1Resp->status()}", 'warn');
+                    }
+                }
+            } catch (\Throwable $e) {
+                WixHelper::log('Auto Products', "SEO fetch exception for {$sourceId}: {$e->getMessage()}", 'warn');
+            }
 
             if ($dryRun) {
-                \App\Models\WixProductMigration::where($migrationKey)->update([
-                    'status'        => 'skipped',
-                    'error_message' => 'dry_run: would import this product'
+                \App\Models\WixProductMigration::create([
+                    'user_id'              => $userId,
+                    'from_store_id'        => $fromStoreId,
+                    'to_store_id'          => $toStoreId,
+                    'source_product_id'    => $sourceId,
+                    'source_product_sku'   => $sourceSku,
+                    'source_product_name'  => $product['name'] ?? null,
+                    'status'               => 'skipped',
+                    'error_message'        => 'dry_run: would import this product',
+                    'destination_product_id' => null,
                 ]);
                 $skipped++;
                 continue;
             }
 
-            // Import into DEST
+            // ---------- Decide: update existing or create new ----------
+            if (!$latestSuccess || empty($latestSuccess->destination_product_id)) {
+                // New product (no prior success)
+                $row = \App\Models\WixProductMigration::create([
+                    'user_id'              => $userId,
+                    'from_store_id'        => $fromStoreId,
+                    'to_store_id'          => $toStoreId,
+                    'source_product_id'    => $sourceId,
+                    'source_product_sku'   => $sourceSku,
+                    'source_product_name'  => $product['name'] ?? null,
+                    'status'               => 'pending',
+                    'error_message'        => null,
+                ]);
+
+                [$result, $err] = $this->importSingleProduct(
+                    $destCatalogVersion,
+                    $toToken,
+                    $product,
+                    $fromStoreId,
+                    $toStoreId,
+                    $userId,
+                    $relationMaps,
+                    $collectionSlugMap,
+                    $row->id
+                );
+
+                if ($result['imported']) {
+                    $row->update([
+                        'status'                 => 'success',
+                        'error_message'          => null,
+                        'destination_product_id' => \Illuminate\Support\Arr::get($result, 'destination_product_id')
+                            ?: (\Illuminate\Support\Arr::get($result, 'product_id') ?: null),
+                        'message'                => 'Added New Product',
+                    ]);
+                    $imported         += (int) $result['imported'];
+                    $inventoryUpdated += (int) $result['inventoryUpdated'];
+                } else {
+                    $row->update([
+                        'status'        => 'failed',
+                        'error_message' => $result['error'] ?: ($err ?: 'Unknown error'),
+                    ]);
+                    $failed++;
+                }
+                continue;
+            }
+
+            // Existing success row found: check destination product availability
+            $destProductId = $latestSuccess->destination_product_id;
+            $destExists = false;
+            if ($destCatalogVersion === 'V3_CATALOG' && $destProductId) {
+                $destResp = Http::withHeaders([
+                    'Authorization' => "Bearer {$toToken}",
+                ])->get("https://www.wixapis.com/stores/v3/products/{$destProductId}");
+                $destExists = $destResp->ok();
+            }
+
+            if ($destExists && $destCatalogVersion === 'V3_CATALOG') {
+                // Update existing destination product
+                [$updated, $err] = $this->updateProductV3(
+                    $toToken,
+                    $product,
+                    $relationMaps,
+                    $destProductId
+                );
+
+                if ($updated) {
+                    $latestSuccess->update([
+                        'source_product_sku'  => $sourceSku,
+                        'source_product_name' => $product['name'] ?? null,
+                        'status'              => 'success',
+                        'error_message'       => null,
+                        'message'             => 'Updated existing product',
+                    ]);
+                    $imported++;
+                } else {
+                    $latestSuccess->update([
+                        'status'        => 'failed',
+                        'error_message' => $err ?: 'Unknown error',
+                    ]);
+                    $failed++;
+                }
+                continue;
+            }
+
+            // Destination product missing: mark old as deleted and create new
+            if ($latestSuccess) {
+                $latestSuccess->update([
+                    'status'  => 'deleted',
+                    'message' => 'Added Deleted Product',
+                ]);
+            }
+
+            $row = \App\Models\WixProductMigration::create([
+                'user_id'              => $userId,
+                'from_store_id'        => $fromStoreId,
+                'to_store_id'          => $toStoreId,
+                'source_product_id'    => $sourceId,
+                'source_product_sku'   => $sourceSku,
+                'source_product_name'  => $product['name'] ?? null,
+                'status'               => 'pending',
+                'error_message'        => null,
+            ]);
+
             [$result, $err] = $this->importSingleProduct(
                 $destCatalogVersion,
                 $toToken,
@@ -313,21 +418,22 @@ class WixProductController extends Controller
                 $toStoreId,
                 $userId,
                 $relationMaps,
-                $collectionSlugMap
+                $collectionSlugMap,
+                $row->id
             );
 
-            // Update row
             if ($result['imported']) {
-                \App\Models\WixProductMigration::where($migrationKey)->update([
+                $row->update([
                     'status'                 => 'success',
                     'error_message'          => null,
                     'destination_product_id' => \Illuminate\Support\Arr::get($result, 'destination_product_id')
                         ?: (\Illuminate\Support\Arr::get($result, 'product_id') ?: null),
+                    'message'                => 'Added Deleted Product',
                 ]);
                 $imported         += (int) $result['imported'];
                 $inventoryUpdated += (int) $result['inventoryUpdated'];
             } else {
-                \App\Models\WixProductMigration::where($migrationKey)->update([
+                $row->update([
                     'status'        => 'failed',
                     'error_message' => $result['error'] ?: ($err ?: 'Unknown error'),
                 ]);
@@ -932,7 +1038,8 @@ class WixProductController extends Controller
                 $toStoreId,
                 $userId,
                 $relationMaps,
-                $collectionSlugMap = []
+                $collectionSlugMap = [],
+                null
             );
 
             if ($result['imported']) {
@@ -1583,11 +1690,12 @@ class WixProductController extends Controller
         return null;
     }
 
-    private function importSingleProduct($catalogVersion, $accessToken, $product, $fromStoreId, $toStoreId, $userId, $relationMaps, &$collectionSlugMap)
+    private function importSingleProduct($catalogVersion, $accessToken, $product, $fromStoreId, $toStoreId, $userId, $relationMaps, &$collectionSlugMap, ?int $migrationRowId = null)
     {
         $migrationKey = [
             'user_id'           => $userId,
             'from_store_id'     => $fromStoreId,
+            'to_store_id'       => $toStoreId,
             'source_product_id' => $product['id'] ?? null,
         ];
 
@@ -1649,7 +1757,11 @@ class WixProductController extends Controller
             $error = "Exception for product {$product['name']}: " . $e->getMessage();
         }
 
-        WixProductMigration::updateOrCreate($migrationKey, $migrationData);
+        if ($migrationRowId) {
+            WixProductMigration::where('id', $migrationRowId)->update($migrationData);
+        } else {
+            WixProductMigration::updateOrCreate($migrationKey, $migrationData);
+        }
 
         // Return now includes the created id so migrator() can persist it
         return [
@@ -1677,6 +1789,624 @@ class WixProductController extends Controller
         return $name;
     }
 
+    /**
+     * Build a V3 product payload (shared by create/update).
+     */
+    private function buildV3ProductPayload($accessToken, $product, array &$relationMaps, ?string $currentProductId = null): array
+    {
+        /* ---------- Helpers ---------- */
+
+        $money = function ($amount, $currency) {
+            return ['amount' => (string) (is_numeric($amount) ? $amount : 0), 'currency' => ($currency ?: 'USD')];
+        };
+
+        $deriveCurrency = function(array $p): string {
+            return (string)(
+                $p['priceData']['currency']
+                ?? $p['price']['currency']
+                ?? $p['convertedPriceData']['currency']
+                ?? 'USD'
+            );
+        };
+
+        $buildPriceBlock = function(array $ctx, string $currency) {
+            $actual = $ctx['priceData']['discountedPrice']
+                ?? $ctx['price']['discountedPrice']
+                ?? $ctx['price']['price']
+                ?? $ctx['priceData']['price']
+                ?? 0;
+
+            $base = $ctx['priceData']['price']
+                ?? $ctx['price']['price']
+                ?? null;
+
+            $out = ['actualPrice' => ['amount' => (string)$actual, 'currency' => $currency]];
+            if ($base !== null && $base !== '' && (float)$base > (float)$actual) {
+                $out['compareAtPrice'] = ['amount' => (string)$base, 'currency' => $currency];
+            }
+            return $out;
+        };
+
+        // Price-per-unit: pass through as exported (no conversion, no uppercasing)
+        $ppPass = function($qty, $unit) {
+            if ($qty === null || $unit === null || $unit === '') return [null, null];
+            $q = max(0.00001, (float)$qty);
+            return [$q, (string)$unit];
+        };
+
+        // Pass-through of common measurement fields (as exported)
+        $mergeMeasurements = function(array $dst, array $src) {
+            $fields = [
+                'weight','weightUnit',
+                'length','width','height','lengthUnit','dimensionsUnit','depth','depthUnit',
+                'volume','volumeUnit',
+                'pricePerUnit'
+            ];
+            foreach ($fields as $k) {
+                if (array_key_exists($k, $src)) $dst[$k] = $src[$k];
+            }
+            return $dst;
+        };
+
+        /* ---------- Brand & Ribbon ---------- */
+
+        $brandPayload  = null;
+        $ribbonPayload = null;
+
+        if (array_key_exists('brand', $product) && $product['brand'] !== null && $product['brand'] !== '') {
+            if (is_string($product['brand'])) $brandPayload = ['name' => trim($product['brand'])];
+            elseif (is_array($product['brand'])) {
+                $brandPayload = $product['brand'];
+                if (empty($brandPayload['name']) && !empty($product['brand_export']['name'])) $brandPayload['name'] = $product['brand_export']['name'];
+            }
+        }
+        if (array_key_exists('ribbon', $product) && $product['ribbon'] !== null && $product['ribbon'] !== '') {
+            if (is_string($product['ribbon'])) $ribbonPayload = ['name' => trim($product['ribbon'])];
+            elseif (is_array($product['ribbon'])) {
+                $ribbonPayload = $product['ribbon'];
+                if (empty($ribbonPayload['name']) && !empty($product['ribbon_export']['name'])) $ribbonPayload['name'] = $product['ribbon_export']['name'];
+            }
+        }
+
+        $destBrandId  = $brandPayload  ? $this->ensureBrandIdV3($accessToken, $brandPayload,  $relationMaps) : null;
+        $destRibbonId = $ribbonPayload ? $this->ensureRibbonIdV3($accessToken, $ribbonPayload, $relationMaps) : null;
+
+        /* ---------- Base product ---------- */
+
+        $productType = strtoupper($product['productType'] ?? 'PHYSICAL');
+        $validTypes  = ['PHYSICAL','DIGITAL','UNSPECIFIED_PRODUCT_TYPE'];
+        if (!in_array($productType, $validTypes, true)) $productType = 'PHYSICAL';
+
+        $productName   = $this->sanitizeProductName($product['name'] ?? '');
+        $requestedSlug = $this->slugifyProduct($productName, $product['slug'] ?? null);
+        $uniqueSlug    = $currentProductId
+            ? $this->ensureUniqueSlugV3ForUpdate($accessToken, $requestedSlug, $currentProductId)
+            : $this->ensureUniqueSlugV3($accessToken, $requestedSlug);
+        $currency      = $deriveCurrency($product);
+
+        // Media
+        $mediaBlock = [];
+        if (!empty($product['media'])) {
+            $sanitized = $this->sanitizeMediaForV3($product['media']);
+            if ($sanitized) $mediaBlock = $sanitized;
+        }
+
+        /* ---------- Info Sections  ---------- */
+
+        $workInfoSections       = $product['infoSections'] ?? [];
+        $workInfoSectionsExport = $product['infoSections_export'] ?? [];
+        if (empty($workInfoSections) && !empty($product['additionalInfoSections'])) {
+            $workInfoSections = [];
+            $workInfoSectionsExport = [];
+            $i = 0;
+            foreach ((array)$product['additionalInfoSections'] as $ais) {
+                $title  = trim((string)($ais['title'] ?? 'Info Section'));
+                $unique = $this->slugifyUnique($title ?: ('info-section-'.(++$i)));
+                $workInfoSections[] = ['uniqueName' => $unique, 'title' => $title];
+                $workInfoSectionsExport[] = [
+                    'uniqueName'       => $unique,
+                    'title'            => $title,
+                    'plainDescription' => $ais['description'] ?? $ais['descriptionHtml'] ?? ($ais['descriptionPlainText'] ?? '')
+                ];
+            }
+        }
+
+        $infoSectionRefs = [];
+        if ($workInfoSections) {
+            $exportByKey = [];
+            foreach ($workInfoSectionsExport as $is) {
+                if (!empty($is['id']))         $exportByKey['id:'.$is['id']] = $is;
+                if (!empty($is['uniqueName'])) $exportByKey['u:'.mb_strtolower($is['uniqueName'])] = $is;
+            }
+            foreach ($workInfoSections as $info) {
+                $src = is_array($info) ? $info : ['id' => $info];
+                $enr = null;
+                if (!empty($src['id']) && isset($exportByKey['id:'.$src['id']])) $enr = $exportByKey['id:'.$src['id']];
+                elseif (!empty($src['uniqueName'])) {
+                    $key = 'u:'.mb_strtolower($src['uniqueName']);
+                    if (isset($exportByKey[$key])) $enr = $exportByKey[$key];
+                }
+                $destId = $this->ensureInfoSectionIdV3($accessToken, $src, $enr, $relationMaps);
+                if ($destId) $infoSectionRefs[] = ['id' => $destId];
+            }
+        }
+
+        /* ---------- Options & Modifiers (unchanged mapping logic) ---------- */
+
+        $options   = [];
+        $modifiers = [];
+        $optionsByName = [];
+
+        $addOrMergeOption = function(array $opt) use (&$options, &$optionsByName) {
+            if (empty($opt['name'])) return;
+            unset($opt['id']);
+            if (!empty($opt['choicesSettings']['choices'])) {
+                foreach ($opt['choicesSettings']['choices'] as &$ch) unset($ch['id'], $ch['choiceId']);
+            }
+            $key = mb_strtolower($opt['name']);
+            if (!isset($optionsByName[$key])) { $optionsByName[$key] = count($options); $options[] = $opt; return; }
+            $idx = $optionsByName[$key]; $existing = &$options[$idx];
+            if (empty($existing['optionRenderType']) && !empty($opt['optionRenderType'])) $existing['optionRenderType'] = $opt['optionRenderType'];
+            if (empty($existing['choicesSettings']['choices'])) $existing['choicesSettings']['choices'] = [];
+            $seen = [];
+            foreach ($existing['choicesSettings']['choices'] as $c) { $nm = mb_strtolower($c['name'] ?? ''); if ($nm !== '') $seen[$nm] = true; }
+            if (!empty($opt['choicesSettings']['choices'])) {
+                foreach ($opt['choicesSettings']['choices'] as $c) {
+                    $nm = mb_strtolower($c['name'] ?? ''); if ($nm !== '' && !isset($seen[$nm])) $existing['choicesSettings']['choices'][] = $c;
+                }
+            }
+        };
+
+        if (!empty($product['productOptions']) && is_array($product['productOptions'])) {
+            foreach ($product['productOptions'] as $opt) {
+                $optName = trim((string)($opt['name'] ?? '')); if ($optName === '') continue;
+                $renderType = (strtolower($opt['optionType'] ?? '') === 'color') ? 'SWATCH_CHOICES' : 'TEXT_CHOICES';
+                $seen = []; $choices = [];
+                foreach ((array)($opt['choices'] ?? []) as $c) {
+                    $label = $c['description'] ?? $c['value'] ?? null; if ($label === null || $label === '') continue;
+                    $k = mb_strtolower(trim((string)$label)); if (isset($seen[$k])) continue; $seen[$k] = true;
+                    $choiceOut = ['name'=>(string)$label, 'choiceType'=>($renderType === 'SWATCH_CHOICES') ? 'ONE_COLOR' : 'CHOICE_TEXT'];
+                    if ($renderType === 'SWATCH_CHOICES' && !empty($c['value']) && is_string($c['value'])) $choiceOut['colorCode'] = $c['value'];
+                    if (!empty($c['media']) && is_array($c['media'])) { $linked = $this->extractV3MediaItems($c['media']); if ($linked) $choiceOut['linkedMedia'] = $linked; }
+                    if (array_key_exists('inStock', $c)) $choiceOut['inStock'] = (bool)$c['inStock'];
+                    if (array_key_exists('visible', $c)) $choiceOut['visible'] = (bool)$c['visible'];
+                    $choices[] = $choiceOut;
+                }
+                if ($choices) $addOrMergeOption(['name'=>$optName,'optionRenderType'=>$renderType,'choicesSettings'=>['choices'=>$choices]]);
+            }
+        }
+
+        $exportById = [];
+        foreach (($product['customizations_export'] ?? []) as $cx) if (!empty($cx['id'])) $exportById[$cx['id']] = $cx;
+        if (!empty($product['customizations']) && is_array($product['customizations'])) {
+            foreach ($product['customizations'] as $cust) {
+                $src  = is_array($cust) ? $cust : ['id' => $cust];
+                $full = (!empty($src['id']) && isset($exportById[$src['id']])) ? $exportById[$src['id']] + $src : $src;
+                $ctype = $full['customizationType'] ?? $full['type'] ?? null;
+                if ($ctype === 'PRODUCT_OPTION') {
+                    $mapped = $this->mapCustomizationToProductOption($full); if ($mapped) $addOrMergeOption($mapped);
+                } elseif ($ctype === 'MODIFIER') {
+                    $mapped = $this->mapCustomizationToProductModifier($full);
+                    if ($mapped) { if (is_array($src) && array_key_exists('mandatory', $src)) $mapped['mandatory'] = (bool)$src['mandatory']; unset($mapped['id']); $modifiers[] = $mapped; }
+                }
+            }
+        }
+        if (!empty($product['customTextFields']) && is_array($product['customTextFields'])) {
+            foreach ($product['customTextFields'] as $ctf) {
+                $title = $ctf['title'] ?? 'Custom Text';
+                $modifiers[] = ['name'=>$title,'modifierRenderType'=>'FREE_TEXT','mandatory'=>(bool)($ctf['mandatory'] ?? $ctf['required'] ?? false),
+                    'freeTextSettings'=>['title'=>$title,'minCharCount'=>0,'maxCharCount'=>(int)($ctf['maxLength'] ?? 500),'defaultAddedPrice'=>'0']];
+            }
+        }
+
+        /* ---------- SEO ---------- */
+
+        try {
+            $exportSeo = $product['seoData'] ?? null;
+            $metaDesc = null;
+            $titleTag = null;
+
+            if (is_array($exportSeo['tags'] ?? null)) {
+                foreach ($exportSeo['tags'] as $t) {
+                    if (($t['type'] ?? '') === 'title' && !empty($t['children'])) {
+                        $titleTag = trim((string)$t['children']);
+                    }
+                    if (($t['type'] ?? '') === 'meta') {
+                        $props = $t['props'] ?? [];
+                        if (isset($props['name']) && mb_strtolower($props['name']) === 'description' && !empty($props['content'])) {
+                            $metaDesc = (string)$props['content'];
+                        }
+                    }
+                }
+            }
+            if ($metaDesc === null) {
+                $raw = (string)($product['description'] ?? '');
+                $clean = trim(preg_replace('/\\s+/u', ' ', html_entity_decode(strip_tags($raw))));
+                if ($clean !== '') $metaDesc = mb_substr($clean, 0, 300);
+            }
+            $keywords = [];
+            if (!empty($exportSeo['settings']['keywords']) && is_array($exportSeo['settings']['keywords'])) {
+                $keywords = array_values(array_filter(array_map('trim', $exportSeo['settings']['keywords'])));
+            }
+            $preventAutoRedirect = (bool)($exportSeo['settings']['preventAutoRedirect'] ?? false);
+
+            $seoTags = [];
+            if ($titleTag) {
+                $seoTags[] = ['type'=>'title','children'=>$titleTag,'custom'=>false,'disabled'=>false];
+            }
+            if ($metaDesc !== null && $metaDesc !== '') {
+                $seoTags[] = ['type'=>'meta','props'=>['name'=>'description','content'=>$metaDesc],'children'=>'','custom'=>false,'disabled'=>false];
+            }
+            if (!empty($keywords)) {
+                $seoTags[] = ['type'=>'meta','props'=>['name'=>'keywords','content'=>implode(', ', $keywords)],'children'=>'','custom'=>false,'disabled'=>false];
+            }
+
+            if (!empty($seoTags)) {
+                $seoBlock = [
+                    'tags' => $seoTags,
+                    'settings' => ['preventAutoRedirect'=>$preventAutoRedirect,'keywords'=>$keywords],
+                ];
+            }
+        } catch (\Throwable $e) {
+            \App\Helpers\WixHelper::log('Import Products+Inventory', 'seoData build failed: '.$e->getMessage(), 'warn');
+        }
+
+        /* ---------- Variants & Inventory ---------- */
+
+        $optionRenderTypeByName = [];
+        foreach ($options as $o) if (!empty($o['name'])) $optionRenderTypeByName[$o['name']] = $o['optionRenderType'] ?? 'TEXT_CHOICES';
+
+        $optionsOrder = array_map(fn($o) => $o['name'], $options ?: []);
+        $choicesByOption = [];
+        foreach ($options as $o) $choicesByOption[$o['name']] = array_map(fn($c) => $c['name'], $o['choicesSettings']['choices'] ?? []);
+
+        $variantSource = !empty($product['variants_full']) ? $product['variants_full'] : ($product['variants'] ?? []);
+        $anyIncomingWithChoices = false;
+        foreach ($variantSource as $vv) { if ($this->variantHasNonEmptyChoices($vv)) { $anyIncomingWithChoices = true; break; } }
+
+        // Preorder (product-level)
+        $preorderPayload = null;
+        $pre = $product['inventoryItem_full']['preorderInfo'] ?? null;
+        if (is_array($pre) && !empty($pre['enabled'])) {
+            $preorderPayload = ['enabled' => true];
+            if (!empty($pre['message'])) $preorderPayload['message'] = (string)$pre['message'];
+            if (isset($pre['limit']))    $preorderPayload['limit']   = (int)$pre['limit'];
+        }
+
+        // Global qty if only 0000 variant carries it
+        $globalVariantQty = null;
+        if (!$anyIncomingWithChoices) {
+            foreach ($variantSource as $row) {
+                $iv2 = $row['inventory_v2'] ?? null;
+                if (is_array($iv2) && isset($iv2['quantity']) && $iv2['quantity'] !== null && $iv2['quantity'] !== '') { $globalVariantQty = (int)$iv2['quantity']; break; }
+            }
+        }
+
+        $baseSku = null;
+        if (!empty($product['sku']) && is_string($product['sku'])) $baseSku = trim($product['sku']);
+        if (!$baseSku && !empty($variantSource[0]['variant']['sku'])) $baseSku = trim((string)$variantSource[0]['variant']['sku']);
+
+        // Product-level PPU pass-through
+        $ppud = $product['pricePerUnitData'] ?? null;
+        $baseQty  = $ppud['baseQuantity'] ?? null;   $baseUnit = $ppud['baseMeasurementUnit'] ?? null;
+        [$baseQtyPass,  $baseUnitPass]  = $ppPass($baseQty,  $baseUnit);
+        $totalQty  = $ppud['totalQuantity'] ?? null; $totalUnit = $ppud['totalMeasurementUnit'] ?? null;
+        [$totalQtyPass, $totalUnitPass] = $ppPass($totalQty, $totalUnit);
+
+        $globalMinCost   = isset($product['costRange']['minValue']) ? (float)$product['costRange']['minValue'] : null;
+        $globalMaxCost   = isset($product['costRange']['maxValue']) ? (float)$product['costRange']['maxValue'] : null;
+        $productItemCost = isset($product['costAndProfitData']['itemCost']) ? (float)$product['costAndProfitData']['itemCost'] : null;
+
+        $variants = [];
+
+        // A) Incoming variants with choices
+        if ($anyIncomingWithChoices) {
+            foreach ($variantSource as $v) {
+                $flat = isset($v['variant']) && is_array($v['variant']) ? $v['variant'] : $v;
+
+                // build choice pairs
+                $pairs = [];
+                $choicesRaw = $v['choices'] ?? $flat['choices'] ?? [];
+                if ($choicesRaw && !array_is_list($choicesRaw)) {
+                    foreach ($choicesRaw as $oName => $val) if ($val !== null && $val !== '') $pairs[] = ['optionName'=>(string)$oName, 'choiceName'=>(string)$val];
+                } elseif (is_array($choicesRaw)) {
+                    foreach ($choicesRaw as $c) {
+                        $oName = $c['option'] ?? $c['name'] ?? $c['key'] ?? null;
+                        $val   = $c['choice'] ?? $c['value'] ?? $c['description'] ?? null;
+                        if ($oName && $val !== null && $val !== '') $pairs[] = ['optionName'=>$oName, 'choiceName'=>$val];
+                    }
+                }
+                // fill missing options
+                if (!empty($optionsOrder)) {
+                    $have = [];
+                    foreach ($pairs as $p) $have[mb_strtolower($p['optionName'])] = true;
+                    foreach ($optionsOrder as $oName) {
+                        if (!isset($have[mb_strtolower($oName)]) && !empty($choicesByOption[$oName][0])) {
+                            $pairs[] = ['optionName'=>$oName,'choiceName'=>$choicesByOption[$oName][0]];
+                        }
+                    }
+                }
+
+                $price = $buildPriceBlock($flat + $product, $currency);
+
+                // source inventory
+                $iv2      = is_array($v['inventory_v2'] ?? null) ? $v['inventory_v2'] : [];
+                $qty      = array_key_exists('quantity', $iv2) ? (int)$iv2['quantity'] : ($flat['stock']['quantity'] ?? ($v['stock']['quantity'] ?? null));
+                $inStock  = array_key_exists('inStock',  $iv2) ? (bool)$iv2['inStock']  : ($flat['stock']['inStock'] ?? ($v['stock']['inStock'] ?? ($product['stock']['inStock'] ?? null)));
+                $status   = $flat['stock']['inventoryStatus'] ?? $v['stock']['inventoryStatus'] ?? $product['stock']['inventoryStatus'] ?? null;
+                $track    = $this->readTrackFlag($flat + $v, $product);
+
+                $inventoryItem = $this->buildV3InventoryItem(
+                    $qty !== null ? (int)$qty : null,
+                    $inStock !== null ? (bool)$inStock : null,
+                    $status ? (string)$status : null,
+                    $track
+                );
+                $this->applyPreorderToInventory($inventoryItem, $preorderPayload);
+
+                $one = ['visible'=>(bool)($flat['visible'] ?? true), 'price'=>$price, 'inventoryItem'=>$inventoryItem, 'choices'=>[]];
+
+                // measurements on variant
+                if (!empty($flat['physicalProperties']) && is_array($flat['physicalProperties'])) {
+                    $one['physicalProperties'] = $mergeMeasurements(($one['physicalProperties'] ?? []), $flat['physicalProperties']);
+                }
+                if (!empty($flat['weight'])) {
+                    $one['physicalProperties']['weight'] = $flat['weight'];
+                    if (isset($flat['weightUnit'])) $one['physicalProperties']['weightUnit'] = $flat['weightUnit'];
+                }
+
+                // PPU on variant from total*
+                if ($totalQtyPass !== null && $totalUnitPass !== null) {
+                    if (empty($one['physicalProperties']) || !is_array($one['physicalProperties'])) $one['physicalProperties'] = [];
+                    $one['physicalProperties']['pricePerUnit']['settings'] = ['quantity'=>$totalQtyPass,'measurementUnit'=>$totalUnitPass];
+                }
+
+                $skuRaw = $flat['sku'] ?? $v['sku'] ?? null;
+                if (is_string($skuRaw) && trim($skuRaw) !== '') $one['sku'] = trim($skuRaw);
+
+                // cost
+                $variantItemCost = $flat['costAndProfitData']['itemCost'] ?? null;
+                if ($variantItemCost === null) $variantItemCost = $productItemCost ?? $globalMinCost;
+                if ($variantItemCost !== null) $one['revenueDetails']['cost'] = $money($variantItemCost, $currency);
+
+                foreach ($pairs as $p) {
+                    $renderType = $optionRenderTypeByName[$p['optionName']] ?? 'TEXT_CHOICES';
+                    $one['choices'][] = ['optionChoiceNames' => ['optionName'=>$p['optionName'], 'choiceName'=>$p['choiceName'], 'renderType'=>$renderType]];
+                }
+                $variants[] = $one;
+            }
+        }
+
+        // B) Synthesize combos
+        elseif (!empty($optionsOrder)) {
+            $lists = [];
+            foreach ($optionsOrder as $optName) {
+                $vals = $choicesByOption[$optName] ?? [];
+                if (empty($vals)) { $lists = []; break; }
+                $lists[$optName] = $vals;
+            }
+
+            if (!empty($lists)) {
+                $combos = [[]];
+                foreach ($lists as $optName => $vals) {
+                    $next = [];
+                    foreach ($combos as $base) foreach ($vals as $val) { $tmp=$base; $tmp[$optName]=$val; $next[]=$tmp; }
+                    $combos = $next;
+                }
+
+                $priceBlock = $buildPriceBlock($product, $currency);
+                $track      = $this->readTrackFlag($product, $product);
+
+                $prodQty     = isset($product['stock']['quantity']) ? (int)$product['stock']['quantity'] : null;
+                $prodInStock = array_key_exists('inStock', $product['stock'] ?? []) ? (bool)$product['stock']['inStock'] : null;
+                $status      = $product['stock']['inventoryStatus'] ?? null;
+                $baseQtySrc  = ($globalVariantQty !== null) ? $globalVariantQty : $prodQty;
+
+                $baseInventory = $this->buildV3InventoryItem(
+                    $track ? ($baseQtySrc ?? 0) : null,
+                    $track ? null : ($prodInStock ?? true),
+                    $status ? (string)$status : null,
+                    $track
+                );
+                $this->applyPreorderToInventory($baseInventory, $preorderPayload);
+
+                $skuIdx = 0;
+                foreach ($combos as $assoc) {
+                    $one = ['visible'=>(bool)($product['visible'] ?? true), 'price'=>$priceBlock, 'inventoryItem'=>$baseInventory, 'choices'=>[]];
+
+                    // product-level measurements into variant
+                    if (!empty($product['physicalProperties']) && is_array($product['physicalProperties'])) {
+                        $one['physicalProperties'] = $mergeMeasurements(($one['physicalProperties'] ?? []), $product['physicalProperties']);
+                    }
+                    if (isset($product['weight'])) {
+                        $one['physicalProperties']['weight'] = $product['weight'];
+                        if (isset($product['weightUnit'])) $one['physicalProperties']['weightUnit'] = $product['weightUnit'];
+                    }
+
+                    // PPU on variant from total*
+                    if ($totalQtyPass !== null && $totalUnitPass !== null) {
+                        if (empty($one['physicalProperties']) || !is_array($one['physicalProperties'])) $one['physicalProperties'] = [];
+                        $one['physicalProperties']['pricePerUnit']['settings'] = ['quantity'=>$totalQtyPass,'measurementUnit'=>$totalUnitPass];
+                    }
+
+                    if ($baseSku && empty($one['sku'])) $one['sku'] = $baseSku . '-' . (++$skuIdx);
+
+                    // cost
+                    $variantItemCost = $productItemCost ?? $globalMinCost;
+                    if ($variantItemCost !== null) $one['revenueDetails']['cost'] = $money($variantItemCost, $currency);
+
+                    foreach ($assoc as $oName => $cName) {
+                        $renderType = $optionRenderTypeByName[$oName] ?? 'TEXT_CHOICES';
+                        $one['choices'][] = ['optionChoiceNames' => ['optionName'=>$oName, 'choiceName'=>$cName, 'renderType'=>$renderType]];
+                    }
+                    $variants[] = $one;
+                }
+            }
+        }
+
+        // C) Single-variant fallback
+        if (empty($variants)) {
+            $priceBlock = $buildPriceBlock($product, $currency);
+
+            $track      = $this->readTrackFlag($product, $product);
+            $qty        = isset($product['stock']['quantity']) ? (int)$product['stock']['quantity'] : null;
+            $inStock    = array_key_exists('inStock', $product['stock'] ?? []) ? (bool)$product['stock']['inStock'] : null;
+            $status     = $product['stock']['inventoryStatus'] ?? null;
+
+            $inventory  = $this->buildV3InventoryItem(
+                $track ? ($qty ?? 0) : null,
+                $track ? null : ($inStock ?? true),
+                $status ? (string)$status : null,
+                $track
+            );
+            $this->applyPreorderToInventory($inventory, $preorderPayload);
+
+            $one = ['choices'=>[], 'visible'=>(bool)($product['visible'] ?? true), 'price'=>$priceBlock, 'inventoryItem'=>$inventory];
+
+            // measurements (product-level → variant)
+            if (!empty($product['physicalProperties']) && is_array($product['physicalProperties'])) {
+                $one['physicalProperties'] = $mergeMeasurements(($one['physicalProperties'] ?? []), $product['physicalProperties']);
+            }
+            if (isset($product['weight'])) {
+                $one['physicalProperties']['weight'] = $product['weight'];
+                if (isset($product['weightUnit'])) $one['physicalProperties']['weightUnit'] = $product['weightUnit'];
+            }
+
+            // PPU on variant from total*
+            if ($totalQtyPass !== null && $totalUnitPass !== null) {
+                if (empty($one['physicalProperties']) || !is_array($one['physicalProperties'])) $one['physicalProperties'] = [];
+                $one['physicalProperties']['pricePerUnit']['settings'] = ['quantity'=>$totalQtyPass,'measurementUnit'=>$totalUnitPass];
+            }
+
+            $skuRaw = $product['sku'] ?? null;
+            if (is_string($skuRaw) && trim($skuRaw) !== '') $one['sku'] = trim($skuRaw);
+
+            $variantItemCost = $productItemCost ?? $globalMinCost;
+            if ($variantItemCost !== null) $one['revenueDetails']['cost'] = $money($variantItemCost, $currency);
+
+            $variants[] = $one;
+        }
+
+        /* ---------- NEW: enforce per-product unique SKUs ---------- */
+        $this->dedupeVariantSkus($variants, $baseSku ?? ($product['sku'] ?? null));
+
+        /* ---------- Compose product ---------- */
+
+        $productBody = [
+            'name'               => $productName,
+            'slug'               => $uniqueSlug,
+            'plainDescription'   => is_string($product['description'] ?? null) ? $product['description'] : '',
+            'visible'            => (bool)($product['visible'] ?? true),
+            'productType'        => $productType,
+            'variantsInfo'       => ['variants' => $variants],
+            'physicalProperties' => (object)[],
+            'currency'           => $currency,
+        ];
+
+        if (!empty($product['physicalProperties']) && is_array($product['physicalProperties'])) {
+            $productBody['physicalProperties'] = $mergeMeasurements((array)$productBody['physicalProperties'], $product['physicalProperties']);
+        }
+        if (isset($product['weight'])) {
+            if (!is_array($productBody['physicalProperties'])) $productBody['physicalProperties'] = [];
+            $productBody['physicalProperties']['weight'] = $product['weight'];
+            if (isset($product['weightUnit'])) $productBody['physicalProperties']['weightUnit'] = $product['weightUnit'];
+        }
+
+        // product-level PPU from base*
+        if ($baseQtyPass !== null && $baseUnitPass !== null) {
+            if (!is_array($productBody['physicalProperties'])) $productBody['physicalProperties'] = [];
+            $productBody['physicalProperties']['pricePerUnit'] = ['quantity'=>$baseQtyPass,'measurementUnit'=>$baseUnitPass];
+        }
+
+        if (!empty($mediaBlock))         $productBody['media']        = $mediaBlock;
+        if (!empty($infoSectionRefs))    $productBody['infoSections'] = $infoSectionRefs;
+        if (!empty($options))            $productBody['options']      = $options;
+        if (!empty($modifiers))          $productBody['modifiers']    = $modifiers;
+        if ($destBrandId)                $productBody['brand']        = ['id' => $destBrandId];
+        elseif (!empty($brandPayload['name']))  $productBody['brand']  = ['name' => $brandPayload['name']];
+        if ($destRibbonId)               $productBody['ribbon']       = ['id' => $destRibbonId];
+        elseif (!empty($ribbonPayload['name'])) $productBody['ribbon'] = ['name' => $ribbonPayload['name']];
+        if (isset($seoBlock))            $productBody['seoData']      = $seoBlock;
+
+        if (isset($product['pricePerUnitData']) && is_array($product['pricePerUnitData'])) {
+            $ppudPass = $product['pricePerUnitData'];
+            $productBody['pricePerUnitData'] = array_filter([
+                'totalQuantity'        => isset($ppudPass['totalQuantity']) ? (float)$ppudPass['totalQuantity'] : null,
+                'totalMeasurementUnit' => $ppudPass['totalMeasurementUnit'] ?? null,
+                'baseQuantity'         => isset($ppudPass['baseQuantity']) ? (float)$ppudPass['baseQuantity'] : null,
+                'baseMeasurementUnit'  => $ppudPass['baseMeasurementUnit'] ?? null,
+            ], fn($v) => $v !== null);
+        }
+        if (array_key_exists('pricePerUnit', $product))              $productBody['pricePerUnit'] = (float)$product['pricePerUnit'];
+        elseif (isset($product['price']['pricePerUnit']))           $productBody['pricePerUnit'] = (float)$product['price']['pricePerUnit'];
+        elseif (isset($product['priceData']['pricePerUnit']))       $productBody['pricePerUnit'] = (float)$product['priceData']['pricePerUnit'];
+
+        if ($globalMinCost !== null || $globalMaxCost !== null) {
+            $productBody['costRange'] = [];
+            if ($globalMinCost !== null) $productBody['costRange']['minValue'] = $money($globalMinCost, $currency);
+            if ($globalMaxCost !== null) $productBody['costRange']['maxValue'] = $money($globalMaxCost, $currency);
+        }
+
+        if (empty($productBody['physicalProperties'])) $productBody['physicalProperties'] = (object)[];
+
+        /* ---------- Categories ---------- */
+
+        $destCategoryIds = [];
+        $sourceIds = (array)($product['collectionIds'] ?? []);
+        $sourceSlugs = (array)($product['collectionSlugs'] ?? []);
+        $slugById = [];
+        foreach ($sourceIds as $idx => $srcId) {
+            if (isset($sourceSlugs[$idx])) {
+                $slugById[$srcId] = $sourceSlugs[$idx];
+            }
+        }
+
+        $appNamespace = $relationMaps['appNamespace'] ?? '@wix/stores';
+        $treeKey      = $relationMaps['treeKey']      ?? null;
+        $findV3CategoryIdBySlug = function(string $slug) use ($accessToken, $appNamespace, $treeKey) {
+            $body = ['search' => ['paging' => ['limit' => 50], 'search' => ['expression' => $slug]], "treeReference" => ["appNamespace" => $appNamespace]];
+            if ($treeKey !== null && trim((string)$treeKey) !== '') $body['treeReference']['treeKey'] = $treeKey;
+            $resp = Http::withHeaders(['Authorization'=> $accessToken, 'Content-Type'=>'application/json'])
+                ->post('https://www.wixapis.com/categories/v1/categories/search', $body);
+            if (!$resp->ok()) return null;
+            $cats = $resp->json('categories') ?? [];
+            foreach ($cats as $c) if (isset($c['slug']) && mb_strtolower($c['slug']) === mb_strtolower($slug)) return $c['id'] ?? null;
+            return null;
+        };
+
+        foreach ($sourceIds as $srcId) {
+            if (!is_string($srcId) || trim($srcId) === '') continue;
+
+            $destId = $relationMaps['collectionIdMap'][$srcId] ?? null;
+
+            if ($destId) {
+                if ($destId !== '00000000-000000-000000-000000000001') {
+                    $destCategoryIds[] = $destId;
+                }
+                continue; // Prioritize ID mapping
+            }
+
+            // Fallback to slug search
+            $slug = $slugById[$srcId] ?? null;
+            if (is_string($slug) && trim($slug) !== '') {
+                $cid = $findV3CategoryIdBySlug($slug);
+                if ($cid) $destCategoryIds[] = $cid;
+            }
+        }
+        $destCategoryIds = array_values(array_unique($destCategoryIds));
+
+        return [
+            'productBody'      => $productBody,
+            'variants'         => $variants,
+            'destCategoryIds'  => $destCategoryIds,
+            'appNamespace'     => $appNamespace,
+            'treeKey'          => $treeKey,
+            'preorderPayload'  => $preorderPayload,
+            'globalVariantQty' => $globalVariantQty,
+        ];
+    }
+
+ 
     
     /**
      * Create a V3 product (with inventory) and attach categories.
@@ -1689,8 +2419,449 @@ class WixProductController extends Controller
      * - Preorder preserved without forcing quantity=0 when track=false
      * - PPU passed only for KG/G (no conversion; avoids imperial error)
      */
+    private function importProductV3New($accessToken, $product, array &$relationMaps)
+    {
+        $payload = $this->buildV3ProductPayload($accessToken, $product, $relationMaps);
+        $productBody = $payload['productBody'];
+        $variants = $payload['variants'];
+        $destCategoryIds = $payload['destCategoryIds'];
+        $appNamespace = $payload['appNamespace'];
+        $treeKey = $payload['treeKey'];
+        $preorderPayload = $payload['preorderPayload'];
+        $globalVariantQty = $payload['globalVariantQty'];
+
+        /* ---------- Create product-with-inventory ---------- */
+
+        $createBody = ['product' => $productBody, 'returnEntity' => true];
+        \App\Helpers\WixHelper::log('Import Products+Inventory', ['step' => 'creating V3', 'payload' => $createBody]);
+
+        // Mild pacing before a heavy create to reduce burstiness even further
+        usleep(120 * 1000); // 120 ms
+
+        $response = $this->httpWithRetry(
+            'POST',
+            'https://www.wixapis.com/stores/v3/products-with-inventory',
+            ['Authorization' => "Bearer {$accessToken}", 'Content-Type' => 'application/json'],
+            $createBody,
+            5
+        );
+
+        if (!$response->ok() && isset($productBody['seoData'])) {
+            $bodyText = (string)$response->body();
+            if (stripos($bodyText, 'seo') !== false || stripos($bodyText, 'unknown') !== false || $response->status() === 400) {
+                \App\Helpers\WixHelper::log('Import Products+Inventory', 'Create failed, retrying without seoData…', 'warn');
+                unset($productBody['seoData']);
+                usleep(120 * 1000); // re-pace
+                $response = $this->httpWithRetry(
+                    'POST',
+                    'https://www.wixapis.com/stores/v3/products-with-inventory',
+                    ['Authorization' => "Bearer {$accessToken}", 'Content-Type' => 'application/json'],
+                    ['product' => $productBody, 'returnEntity' => true],
+                    4
+                );
+            }
+        }
+
+        \App\Helpers\WixHelper::log('Import Products+Inventory',
+            ['step' => 'V3 response', 'ok' => $response->ok(), 'status' => $response->status(), 'response' => $response->body()],
+            $response->ok() ? 'success' : 'error'
+        );
+
+        if (!($response->ok() && isset($response->json()['product']['id']))) {
+            $firstVariant = $variants[0] ?? [];
+            $snippet = json_encode($firstVariant, JSON_UNESCAPED_UNICODE);
+            return [null, 'V3 product-with-inventory failed: '.$response->body().' | firstVariant='.$snippet];
+        }
+
+        $newProduct = $response->json()['product'];
+        $productId  = $newProduct['id'];
+
+        /* ---------- Categories ---------- */
+
+        if (!empty($destCategoryIds)) {
+            $storesAppId  = env('WIX_STORES_APP_ID', '215238eb-22a5-4c36-9e7b-e7c08025e04e');
+            $catPayload = ['item'=>['catalogItemId'=>$productId,'appId'=>$storesAppId], 'categoryIds'=>array_slice($destCategoryIds, 0, 100), 'treeReference'=>['appNamespace'=>$appNamespace]];
+            if ($treeKey !== null && trim((string)$treeKey) !== '') $catPayload['treeReference']['treeKey'] = $treeKey;
+
+            WixHelper::log('Import Products+Inventory', ['step'=>'categories.add-item', 'payload'=>$catPayload], 'info');
+            $catResp = $this->httpWithRetry(
+                'POST',
+                'https://www.wixapis.com/categories/v1/bulk/categories/add-item',
+                ['Authorization'=> $accessToken, 'Content-Type'=>'application/json'],
+                $catPayload,
+                4
+            );
+            WixHelper::log('Import Products+Inventory', ['step'=>'categories.add-item response','ok'=>$catResp->ok(),'status'=>$catResp->status(),'response'=>$catResp->body()], $catResp->ok() ? 'success' : 'warn');
+        }
+
+        /* ---------- Finalize: per-variant inventory upsert (same stock rules) ---------- */
+
+        try {
+            $createdVariants = $newProduct['variantsInfo']['variants'] ?? [];
+            $createdByKey = [];
+            foreach ($createdVariants as $cv) {
+                $pairs = [];
+                foreach (($cv['choices'] ?? []) as $ch) {
+                    $n = $ch['optionChoiceNames']['optionName'] ?? '';
+                    $v = $ch['optionChoiceNames']['choiceName'] ?? '';
+                    if ($n !== '') $pairs[$n] = $v;
+                }
+                if ($pairs) { ksort($pairs, SORT_NATURAL|SORT_FLAG_CASE); $key = implode('|', array_map(function ($n, $v) { return $n.'='.$v; }, array_keys($pairs), $pairs)); }
+                else $key = '__single__';
+                $createdByKey[$key] = ['variantId' => $cv['id'] ?? null, 'productId' => $productId];
+            }
+
+            $sourceByKey = [];
+            $mkKey = function($row) {
+                $pairs = [];
+                $choicesRaw = $row['choices'] ?? ($row['variant']['choices'] ?? []);
+                if ($choicesRaw && !array_is_list($choicesRaw)) {
+                    foreach ($choicesRaw as $oName => $val) if ($val !== '' && $val !== null) $pairs[$oName] = (string)$val;
+                } elseif (is_array($choicesRaw)) {
+                    foreach ($choicesRaw as $c) {
+                        $o = $c['option'] ?? $c['name'] ?? $c['key'] ?? null;
+                        $v = $c['choice'] ?? $c['value'] ?? $c['description'] ?? null;
+                        if ($o && $v !== null) $pairs[$o] = (string)$v;
+                    }
+                }
+                if ($pairs) { ksort($pairs, SORT_NATURAL|SORT_FLAG_CASE); $key = implode('|', array_map(function ($n, $v) { return $n.'='.$v; }, array_keys($pairs), $pairs)); }
+                return '__single__';
+            };
+            foreach (($product['variants_full'] ?? []) as $sv) $sourceByKey[$mkKey($sv)] = $sv;
+
+            foreach ($createdByKey as $key => $ids) {
+                if (empty($ids['variantId'])) continue;
+
+                $variantId = $ids['variantId'];
+                $src       = $sourceByKey[$key] ?? [];
+                $flat      = isset($src['variant']) && is_array($src['variant']) ? $src['variant'] : $src;
+
+                $iv2   = $src['inventory_v2'] ?? [];
+                $qty   = array_key_exists('quantity', $iv2) ? (int)$iv2['quantity'] : ($flat['stock']['quantity'] ?? null);
+                $inS   = array_key_exists('inStock',  $iv2) ? (bool)$iv2['inStock']  : ($flat['stock']['inStock'] ?? null);
+                $stat  = $flat['stock']['inventoryStatus'] ?? $product['stock']['inventoryStatus'] ?? null;
+                $track = $this->readTrackFlag($flat + $src, $product);
+
+                if ($qty === null && !$this->variantHasNonEmptyChoices($src ?? []) && $globalVariantQty !== null) $qty = $globalVariantQty;
+
+                $inv = $this->buildV3InventoryItem(
+                    $track ? ($qty ?? 0) : null,
+                    $track ? null : $inS,
+                    $stat ? (string)$stat : null,
+                    $track
+                );
+                $this->applyPreorderToInventory($inv, $preorderPayload);
+
+                $payload = ['inventoryItem' => ['productId'=>$productId, 'variantId'=>$variantId] + $inv];
+
+                $this->httpWithRetry(
+                    'POST',
+                    'https://www.wixapis.com/stores/v3/inventory-items',
+                    ['Authorization'=> $accessToken, 'Content-Type'=>'application/json'],
+                    $payload,
+                    4
+                );
+            }
+        } catch (\Throwable $e) {
+            WixHelper::log('Import Products+Inventory', 'inventory finalize failed: '.$e->getMessage(), 'warn');
+        }
+
+        return [$newProduct, null];
+    }
+
+    private function updateProductV3($accessToken, $product, array &$relationMaps, string $productId): array
+    {
+        $destResp = Http::withHeaders([
+            'Authorization' => "Bearer {$accessToken}",
+        ])->get("https://www.wixapis.com/stores/v3/products/{$productId}");
+
+        if (!$destResp->ok()) {
+            return [false, 'V3 product fetch failed for update'];
+        }
+
+        $destProduct = $destResp->json('product') ?? [];
+        $revision = $destProduct['revision'] ?? null;
+        if (!$revision) {
+            return [false, 'Missing V3 revision for update'];
+        }
+
+        $payload = $this->buildV3ProductPayload($accessToken, $product, $relationMaps, $productId);
+        $productBody = $payload['productBody'];
+        $productBody['id'] = $productId;
+        $productBody['revision'] = (string)$revision;
+        $productBody['variantsInfo']['variants'] = $this->applyV3VariantIdsForUpdate(
+            $productBody['variantsInfo']['variants'] ?? [],
+            $destProduct
+        );
+
+        $patch = $this->httpWithRetry(
+            'PATCH',
+            "https://www.wixapis.com/stores/v3/products-with-inventory/{$productId}",
+            ['Authorization' => "Bearer {$accessToken}", 'Content-Type' => 'application/json'],
+            ['product' => $productBody],
+            4
+        );
+
+        if (!$patch->ok()) {
+            return [false, 'V3 product-with-inventory update failed: ' . $patch->body()];
+        }
+
+        // Ensure categories exist on destination (add-only)
+        if (!empty($payload['destCategoryIds'])) {
+            $storesAppId  = env('WIX_STORES_APP_ID', '215238eb-22a5-4c36-9e7b-e7c08025e04e');
+            $catPayload = [
+                'item' => ['catalogItemId'=>$productId,'appId'=>$storesAppId],
+                'categoryIds' => array_slice($payload['destCategoryIds'], 0, 100),
+                'treeReference' => ['appNamespace'=>$payload['appNamespace']],
+            ];
+            if (!empty($payload['treeKey'])) $catPayload['treeReference']['treeKey'] = $payload['treeKey'];
+
+            $this->httpWithRetry(
+                'POST',
+                'https://www.wixapis.com/categories/v1/bulk/categories/add-item',
+                ['Authorization'=> $accessToken, 'Content-Type'=>'application/json'],
+                $catPayload,
+                4
+            );
+        }
+
+        return [true, null];
+    }
+
+    private function applyV3VariantIdsForUpdate(array $variants, array $destProduct): array
+    {
+        $optIdToName = [];
+        $choiceIdToName = [];
+        foreach (($destProduct['options'] ?? []) as $opt) {
+            if (empty($opt['id']) || empty($opt['name'])) continue;
+            $optIdToName[$opt['id']] = $opt['name'];
+            foreach (($opt['choicesSettings']['choices'] ?? []) as $ch) {
+                if (empty($ch['choiceId']) || empty($ch['name'])) continue;
+                $choiceIdToName[$opt['id']][$ch['choiceId']] = $ch['name'];
+            }
+        }
+
+        $destByKey = [];
+        foreach (($destProduct['variantsInfo']['variants'] ?? []) as $dv) {
+            $pairs = [];
+            foreach (($dv['choices'] ?? []) as $ch) {
+                $oid = $ch['optionChoiceIds']['optionId'] ?? null;
+                $cid = $ch['optionChoiceIds']['choiceId'] ?? null;
+                if ($oid && $cid && isset($optIdToName[$oid]) && isset($choiceIdToName[$oid][$cid])) {
+                    $pairs[$optIdToName[$oid]] = $choiceIdToName[$oid][$cid];
+                }
+            }
+            if ($pairs) {
+                ksort($pairs, SORT_NATURAL|SORT_FLAG_CASE);
+                $key = implode('|', array_map(fn($n,$v)=>"$n=$v", array_keys($pairs), $pairs));
+            } else {
+                $key = '__single__';
+            }
+            if (!empty($dv['id'])) $destByKey[$key] = $dv['id'];
+        }
+
+        foreach ($variants as &$v) {
+            $pairs = [];
+            foreach (($v['choices'] ?? []) as $ch) {
+                $n = $ch['optionChoiceNames']['optionName'] ?? null;
+                $c = $ch['optionChoiceNames']['choiceName'] ?? null;
+                if ($n !== null && $c !== null && $c !== '') {
+                    $pairs[$n] = $c;
+                }
+            }
+            if ($pairs) {
+                ksort($pairs, SORT_NATURAL|SORT_FLAG_CASE);
+                $key = implode('|', array_map(fn($n,$v)=>"$n=$v", array_keys($pairs), $pairs));
+            } else {
+                $key = '__single__';
+            }
+            if (isset($destByKey[$key])) {
+                $v['id'] = $destByKey[$key];
+            }
+        }
+        unset($v);
+
+        return $variants;
+    }
+
+    private function updateV3InventoryFromSource(string $accessToken, array $product, string $productId, array $destProduct): void
+    {
+        try {
+            $variantSource = !empty($product['variants_full']) ? $product['variants_full'] : ($product['variants'] ?? []);
+            $anyIncomingWithChoices = false;
+            foreach ($variantSource as $vv) {
+                if ($this->variantHasNonEmptyChoices($vv)) { $anyIncomingWithChoices = true; break; }
+            }
+
+            // Preorder (product-level)
+            $preorderPayload = null;
+            $pre = $product['inventoryItem_full']['preorderInfo'] ?? null;
+            if (is_array($pre) && !empty($pre['enabled'])) {
+                $preorderPayload = ['enabled' => true];
+                if (!empty($pre['message'])) $preorderPayload['message'] = (string)$pre['message'];
+                if (isset($pre['limit']))    $preorderPayload['limit']   = (int)$pre['limit'];
+            }
+
+            // Global qty if only 0000 variant carries it
+            $globalVariantQty = null;
+            if (!$anyIncomingWithChoices) {
+                foreach ($variantSource as $row) {
+                    $iv2 = $row['inventory_v2'] ?? null;
+                    if (is_array($iv2) && isset($iv2['quantity']) && $iv2['quantity'] !== null && $iv2['quantity'] !== '') {
+                        $globalVariantQty = (int)$iv2['quantity'];
+                        break;
+                    }
+                }
+            }
+            $globalProductQty = null;
+            if (isset($product['stock']['quantity']) && $product['stock']['quantity'] !== null && $product['stock']['quantity'] !== '') {
+                $globalProductQty = (int)$product['stock']['quantity'];
+            }
+            $fallbackQty = $globalProductQty ?? $globalVariantQty;
+
+            // Detect "global quantity only" case for products with choices:
+            // if we only have at most one variant qty (or none) but a product-level qty exists,
+            // treat it as a shared quantity and apply to all variants.
+            $useGlobalQtyForAll = false;
+            if ($anyIncomingWithChoices && $globalProductQty !== null) {
+                $hasPerVariantQty = false;
+                foreach ($variantSource as $row) {
+                    $flatRow = isset($row['variant']) && is_array($row['variant']) ? $row['variant'] : $row;
+                    $iv2Row  = $row['inventory_v2'] ?? [];
+                    $q = null;
+                    if (is_array($iv2Row) && array_key_exists('quantity', $iv2Row)) {
+                        $q = $iv2Row['quantity'];
+                    } elseif (isset($flatRow['stock']['quantity'])) {
+                        $q = $flatRow['stock']['quantity'];
+                    }
+                    if ($q !== null && $q !== '' && (int)$q !== 0) {
+                        $hasPerVariantQty = true;
+                        break;
+                    }
+                }
+                if (!$hasPerVariantQty) {
+                    $useGlobalQtyForAll = true;
+                }
+            }
+
+            $createdVariants = $destProduct['variantsInfo']['variants'] ?? [];
+            if (empty($createdVariants)) return;
+
+            // Map existing inventory items by variantId so we can PATCH with revision
+            $invByVariant = [];
+            try {
+                $invQuery = [
+                    'filter' => ['productId' => ['$eq' => $productId]],
+                    'paging' => ['limit' => 200]
+                ];
+                $invResp = $this->queryInventoryItems($accessToken, $invQuery);
+                foreach (($invResp['inventoryItems'] ?? []) as $inv) {
+                    $vid = $inv['variantId'] ?? '__single__';
+                    $invByVariant[$vid] = $inv;
+                }
+            } catch (\Throwable $e) {
+                WixHelper::log('Import Products+Inventory', 'inventory query failed: '.$e->getMessage(), 'warn');
+            }
+
+            $createdByKey = [];
+            foreach ($createdVariants as $cv) {
+                $pairs = [];
+                foreach (($cv['choices'] ?? []) as $ch) {
+                    $n = $ch['optionChoiceNames']['optionName'] ?? '';
+                    $v = $ch['optionChoiceNames']['choiceName'] ?? '';
+                    if ($n !== '') $pairs[$n] = $v;
+                }
+                if ($pairs) {
+                    ksort($pairs, SORT_NATURAL|SORT_FLAG_CASE);
+                    $key = implode('|', array_map(fn($n,$v)=>"$n=$v", array_keys($pairs), $pairs));
+                } else {
+                    $key = '__single__';
+                }
+                $createdByKey[$key] = ['variantId' => $cv['id'] ?? null];
+            }
+
+            $sourceByKey = [];
+            $mkKey = function($row) {
+                $pairs = [];
+                $choicesRaw = $row['choices'] ?? ($row['variant']['choices'] ?? []);
+                if ($choicesRaw && !array_is_list($choicesRaw)) {
+                    foreach ($choicesRaw as $oName => $val) if ($val !== '' && $val !== null) $pairs[$oName] = (string)$val;
+                } elseif (is_array($choicesRaw)) {
+                    foreach ($choicesRaw as $c) {
+                        $o = $c['option'] ?? $c['name'] ?? $c['key'] ?? null;
+                        $v = $c['choice'] ?? $c['value'] ?? $c['description'] ?? null;
+                        if ($o && $v !== null) $pairs[$o] = (string)$v;
+                    }
+                }
+                if ($pairs) {
+                    ksort($pairs, SORT_NATURAL|SORT_FLAG_CASE);
+                    return implode('|', array_map(fn($n,$v)=>"$n=$v", array_keys($pairs), $pairs));
+                }
+                return '__single__';
+            };
+            foreach ($variantSource as $sv) $sourceByKey[$mkKey($sv)] = $sv;
+
+            foreach ($createdByKey as $key => $ids) {
+                if (empty($ids['variantId'])) continue;
+
+                $variantId = $ids['variantId'];
+                $src       = $sourceByKey[$key] ?? [];
+                $flat      = isset($src['variant']) && is_array($src['variant']) ? $src['variant'] : $src;
+
+                $iv2  = $src['inventory_v2'] ?? [];
+                $qty  = array_key_exists('quantity', $iv2) ? (int)$iv2['quantity'] : ($flat['stock']['quantity'] ?? ($product['stock']['quantity'] ?? null));
+                $inS  = array_key_exists('inStock',  $iv2) ? (bool)$iv2['inStock']  : ($flat['stock']['inStock'] ?? ($product['stock']['inStock'] ?? null));
+                $stat = $flat['stock']['inventoryStatus'] ?? ($product['stock']['inventoryStatus'] ?? null);
+                $track = $this->readTrackFlag($flat + $src, $product);
+
+                if ($qty === null && !$this->variantHasNonEmptyChoices($src ?? []) && $globalVariantQty !== null) {
+                    $qty = $globalVariantQty;
+                }
+                if ($useGlobalQtyForAll && $globalProductQty !== null) {
+                    $qty = $globalProductQty;
+                } elseif ($qty === null && $fallbackQty !== null) {
+                    $qty = $fallbackQty;
+                }
+
+                $inv = $this->buildV3InventoryItem(
+                    $qty !== null ? (int)$qty : null,
+                    $inS !== null ? (bool)$inS : null,
+                    $stat ? (string)$stat : null,
+                    $track
+                );
+                $this->applyPreorderToInventory($inv, $preorderPayload);
+
+                $invMeta = $invByVariant[$variantId] ?? null;
+                if ($invMeta && !empty($invMeta['id']) && isset($invMeta['revision'])) {
+                    $payload = ['inventoryItem' => ['id' => $invMeta['id'], 'revision' => (string)$invMeta['revision']] + $inv];
+                    $this->httpWithRetry(
+                        'PATCH',
+                        'https://www.wixapis.com/stores/v3/inventory-items/' . $invMeta['id'],
+                        ['Authorization'=> $accessToken, 'Content-Type'=>'application/json'],
+                        $payload,
+                        4
+                    );
+                } else {
+                    // Fallback: create/upsert inventory item if no revision is available
+                    $payload = ['inventoryItem' => ['productId'=>$productId, 'variantId'=>$variantId] + $inv];
+                    $this->httpWithRetry(
+                        'POST',
+                        'https://www.wixapis.com/stores/v3/inventory-items',
+                        ['Authorization'=> $accessToken, 'Content-Type'=>'application/json'],
+                        $payload,
+                        4
+                    );
+                }
+            }
+        } catch (\Throwable $e) {
+            WixHelper::log('Import Products+Inventory', 'update inventory failed: '.$e->getMessage(), 'warn');
+        }
+    }
+
     private function importProductV3($accessToken, $product, array &$relationMaps)
     {
+        return $this->importProductV3New($accessToken, $product, $relationMaps);
+
         /* ---------- Helpers ---------- */
 
         $money = function ($amount, $currency) {
@@ -1820,7 +2991,7 @@ class WixProductController extends Controller
             if ($sanitized) $mediaBlock = $sanitized;
         }
 
-        /* ---------- Info Sections (unchanged) ---------- */
+        /* ---------- Info Sections  ---------- */
 
         $workInfoSections       = $product['infoSections'] ?? [];
         $workInfoSectionsExport = $product['infoSections_export'] ?? [];
@@ -1928,7 +3099,7 @@ class WixProductController extends Controller
             }
         }
 
-        /* ---------- SEO (unchanged) ---------- */
+        /* ---------- SEO  ---------- */
 
         try {
             $exportSeo = $product['seoData'] ?? null; $metaDesc = null;
@@ -3099,6 +4270,29 @@ class WixProductController extends Controller
         }
     }
 
+    // Ensure slug is UNIQUE in DEST V3 for an update. If taken by another product, append -2, -3, ...
+    private function ensureUniqueSlugV3ForUpdate($accessToken, string $slug, string $currentProductId): string
+    {
+        $base = $slug;
+        $suffix = 2;
+
+        while (true) {
+            $existing = $this->findV3ProductBySlug($accessToken, $slug);
+            if (!$existing || ($existing['id'] ?? null) === $currentProductId) return $slug;
+
+            $candidate = $base . '-' . $suffix;
+            if (mb_strlen($candidate) > 80) {
+                $candidate = mb_substr($candidate, 0, 80);
+                $candidate = rtrim($candidate, '-');
+            }
+            $slug = $candidate;
+            $suffix++;
+            if ($suffix > 9999) {
+                return $base . '-' . substr(sha1((string) microtime(true)), 0, 4);
+            }
+        }
+    }
+
     // Global request pacing memory (per-PHP-process)
     private static float $nextAvailableAtMs = 0.0;
 
@@ -3215,6 +4409,43 @@ class WixProductController extends Controller
         return false;
     }
 
+    // Pull a track flag from variant → product → inventoryItem_full
+    private function readTrackFlag(array $row, array $product): ?bool
+    {
+        if (isset($row['stock']['trackQuantity']))   return (bool)$row['stock']['trackQuantity'];
+        if (isset($row['stock']['trackInventory']))  return (bool)$row['stock']['trackInventory'];
+        if (isset($product['stock']['trackQuantity']))  return (bool)$product['stock']['trackQuantity'];
+        if (isset($product['stock']['trackInventory'])) return (bool)$product['stock']['trackInventory'];
+        if (isset($product['inventoryItem_full']['trackQuantity'])) return (bool)$product['inventoryItem_full']['trackQuantity'];
+        return null;
+    }
+
+    // Build a V3 inventoryItem respecting track flag and availability rules
+    private function buildV3InventoryItem(?int $qty, ?bool $inStock, ?string $explicitStatus, ?bool $track): array
+    {
+        $inv = [];
+        $explicitStatus = is_string($explicitStatus) ? strtoupper($explicitStatus) : null;
+        if ($explicitStatus !== 'IN_STOCK' && $explicitStatus !== 'OUT_OF_STOCK') $explicitStatus = null;
+
+        if ($track === true || $qty !== null) {
+            $inv['quantity'] = (int) max(0, (int)($qty ?? 0));
+            $inv['availabilityStatus'] = $explicitStatus ?: ($inv['quantity'] > 0 ? 'IN_STOCK' : 'OUT_OF_STOCK');
+        } else {
+            $flag = ($explicitStatus === 'OUT_OF_STOCK') ? false : ($explicitStatus === 'IN_STOCK' ? true : (bool)($inStock ?? true));
+            $inv['inStock'] = $flag;
+            $inv['availabilityStatus'] = $explicitStatus ?: ($flag ? 'IN_STOCK' : 'OUT_OF_STOCK');
+        }
+        return $inv;
+    }
+
+    // Preorder: attach flags only (never inject quantity=0 for non-tracking items)
+    private function applyPreorderToInventory(array &$inv, ?array $preorderPayload): void
+    {
+        if (!$preorderPayload) return;
+        $inv['availableForPreorder'] = true;
+        $inv['preorderInfo'] = $preorderPayload;
+    }
+
     // =========================================================
     // Import Product function for automated migration
     // =========================================================
@@ -3308,15 +4539,14 @@ class WixProductController extends Controller
             }
             // ================== V1 FLOW ==================
             elseif ($catalogVersion === 'V1_CATALOG') {
-                // (unchanged V1 path; your filter already forwards pricePerUnitData now)
-                // ... keep your original V1 branch here ...
+                // to be done
             }
             // ================== UNKNOWN CATALOG ==================
             else {
                 $errors[] = "Unknown or unsupported catalog version: $catalogVersion";
             }
 
-            // Persist destination_product_id when created (unchanged)
+            // Persist destination_product_id when created 
             if ($imported > 0 && $newProductId) {
                 \App\Models\WixProductMigration::updateOrCreate(
                     [
