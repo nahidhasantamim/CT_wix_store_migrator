@@ -177,6 +177,7 @@ class WixBackInStockController extends Controller
                 ->whereNotNull('destination_product_id')
                 ->where('to_store_id', $toStoreId)
                 ->where('source_product_id', $sourceProductId)
+                ->where('status', 'success')
                 ->first();
 
             if (!$migration) {

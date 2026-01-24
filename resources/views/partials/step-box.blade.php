@@ -471,7 +471,7 @@
           :disabled="!confirmed"
           aria-disabled="true"
         >
-          {{ $idx < 9 ? 'Next' : 'Finish' }}
+          {{ $idx < 10 ? 'Next' : 'Finish' }}
         </button>
       </div>
     </div>
