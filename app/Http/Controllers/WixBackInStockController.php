@@ -86,7 +86,7 @@ class WixBackInStockController extends Controller
 
             // REAL FAILURE
             $failed++;
-            WixHelper::log('BIS IMPORT', 'Create failed: ' . json_encode($body), 'error');
+            WixHelper::log('BIS IMPORT', 'Create failed', 'error');
         }
 
         return back()->with(
@@ -492,16 +492,67 @@ class WixBackInStockController extends Controller
 
         $body = $resp->json();
 
+        // WixHelper::log(
+        //     'BIS IMPORT',
+        //     'Create response status=' . $resp->status() . ' body=' . json_encode($body),
+        //     $resp->ok() ? 'debug' : 'error'
+        // );
+
+        // =============Request ID Block============
+        // $requestId = data_get($body, 'request.id')
+        //     ?? data_get($body, 'requestId')
+        //     ?? data_get($body, 'id');
+        //
+        // WixHelper::log(
+        //     'BIS IMPORT',
+        //     'Create response status=' . $resp->status()
+        //         . ' request_id=' . ($requestId ?: 'n/a')
+        //         . ' body=' . json_encode($body),
+        //     $resp->ok() ? 'debug' : 'error'
+        // );
+        // =============Request ID Block============
+
+        // =============Request ID Block============
+        $requestId = $resp->header('x-wix-request-id')
+            ?? $resp->header('X-Wix-Request-Id')
+            ?? $resp->header('x-request-id')
+            ?? $resp->header('X-Request-Id')
+            ?? data_get($body, 'details.wix-response-context-bin')
+            ?? data_get($body, 'request.id')
+            ?? data_get($body, 'requestId')
+            ?? data_get($body, 'id');
+
         WixHelper::log(
             'BIS IMPORT',
-            'Create response status=' . $resp->status() . ' body=' . json_encode($body),
+            'Create response status=' . $resp->status()
+                . ' request_id=' . ($requestId ?: 'n/a')
+                . ' body=' . json_encode($body),
             $resp->ok() ? 'debug' : 'error'
         );
+        // =============Request ID Block============
 
+        // return [
+        //     'http_status' => $resp->status(),
+        //     'ok'          => $resp->ok(),
+        //     'body'        => $body,
+        // ];
+
+        // =============Request ID Block============
+        // return [
+        //     'http_status' => $resp->status(),
+        //     'ok'          => $resp->ok(),
+        //     'body'        => $body,
+        //     'request_id'  => $requestId,
+        // ];
+        // =============Request ID Block============
+
+        // =============Request ID Block============
         return [
             'http_status' => $resp->status(),
             'ok'          => $resp->ok(),
             'body'        => $body,
+            'request_id'  => $requestId,
         ];
+        // =============Request ID Block============
     }
 }

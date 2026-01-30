@@ -75,6 +75,130 @@
         </div>
       </div>
 
+      {{-- Products-specific options --}}
+      @if (($cfg['key'] ?? null) === 'products_auto')
+        <!-- ================Specifi Product Migration=========== -->
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css">
+        <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
+
+        <div class="mt-2 space-y-2">
+          <label for="auto_product_ids_{{ $idx }}" class="block mb-1 text-sm font-medium text-gray-900 dark:text-white">
+            Select specific products (optional)
+          </label>
+          <input
+            type="text"
+            id="auto_product_search_{{ $idx }}"
+            placeholder="Search products..."
+            class="bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5
+                   dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-blue-500 dark:focus:border-blue-500"
+          >
+          <select
+            id="auto_product_ids_{{ $idx }}"
+            name="product_ids[]"
+            multiple
+            data-products-url="{{ route('wix.products.byStore') }}"
+            class="bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 min-h-[140px]
+                   dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-blue-500 dark:focus:border-blue-500"
+          >
+            <option value="" disabled>Select From Store first</option>
+          </select>
+          <p class="text-xs text-gray-500 dark:text-gray-400">
+            If you do not select any products, all products will be migrated as usual.
+          </p>
+        </div>
+
+        <script>
+          (function () {
+            var fromSelect = document.getElementById('auto_from_store_{{ $idx }}');
+            var productSelect = document.getElementById('auto_product_ids_{{ $idx }}');
+            var searchInput = document.getElementById('auto_product_search_{{ $idx }}');
+            if (!fromSelect || !productSelect) return;
+
+            var endpoint = productSelect.getAttribute('data-products-url');
+            if (!endpoint) return;
+
+            function initSelect2() {
+              if (window.jQuery && window.jQuery.fn && window.jQuery.fn.select2) {
+                window.jQuery(productSelect).select2({
+                  width: '100%',
+                  placeholder: 'Select products',
+                  allowClear: true
+                });
+                if (searchInput) {
+                  searchInput.style.display = 'none';
+                }
+              }
+            }
+
+            function resetOptions(message) {
+              productSelect.innerHTML = '';
+              var opt = document.createElement('option');
+              opt.disabled = true;
+              opt.value = '';
+              opt.textContent = message;
+              productSelect.appendChild(opt);
+              if (window.jQuery && window.jQuery.fn && window.jQuery.fn.select2) {
+                window.jQuery(productSelect).trigger('change.select2');
+              }
+            }
+
+            function setOptions(items) {
+              productSelect.innerHTML = '';
+              if (!items || !items.length) {
+                resetOptions('No products found for this store');
+                return;
+              }
+              items.forEach(function (p) {
+                var opt = document.createElement('option');
+                opt.value = p.id;
+                opt.textContent = p.name + ' (' + p.id + ')';
+                productSelect.appendChild(opt);
+              });
+              if (window.jQuery && window.jQuery.fn && window.jQuery.fn.select2) {
+                window.jQuery(productSelect).trigger('change.select2');
+              }
+            }
+
+            async function loadProducts() {
+              var fromStore = fromSelect.value;
+              if (!fromStore) {
+                resetOptions('Select From Store first');
+                return;
+              }
+              resetOptions('Loading products...');
+              try {
+                var url = endpoint + '?from_store=' + encodeURIComponent(fromStore);
+                var resp = await fetch(url, { headers: { 'Accept': 'application/json' } });
+                var json = await resp.json();
+                setOptions(json.products || []);
+              } catch (e) {
+                resetOptions('Failed to load products');
+              }
+            }
+
+            fromSelect.addEventListener('change', function () {
+              if (searchInput) searchInput.value = '';
+              loadProducts();
+            });
+
+            initSelect2();
+
+            if (searchInput) {
+              searchInput.addEventListener('input', function () {
+                var q = searchInput.value.toLowerCase().trim();
+                Array.prototype.forEach.call(productSelect.options, function (opt) {
+                  if (opt.disabled) return;
+                  var text = (opt.textContent || '').toLowerCase();
+                  opt.hidden = q !== '' && text.indexOf(q) === -1;
+                });
+              });
+            }
+          })();
+        </script>
+        <!-- ================Specifi Product Migration=========== -->
+      @endif
+
       {{-- Orders-specific options --}}
       @if (($cfg['key'] ?? null) === 'orders_auto')
         <div class="mt-2 space-y-4">

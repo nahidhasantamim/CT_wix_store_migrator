@@ -98,6 +98,9 @@ Route::middleware('auth')->group(function () {
     // Products Migration Routes
     Route::post('/wix/products/auto-migrate', [WixProductController::class, 'migrateAuto'])->name('wix.migrate.products');
     Route::post('/wix/products/sync-seo', [WixProductController::class, 'syncProductSeoData'])->name('wix.products.syncSeo');
+    // ================Specifi Product Migration===========
+    Route::get('/wix/products/by-store', [WixProductController::class, 'listProductsForStore'])->name('wix.products.byStore');
+    // ================Specifi Product Migration===========
 
     Route::get('/wix/{store}/export-products', [WixProductController::class, 'export'])->name('wix.export.products');
     Route::post('/wix/{store}/import-products', [WixProductController::class, 'import'])->name('wix.import.products');
@@ -152,4 +155,3 @@ Route::middleware('auth')->group(function () {
     Route::post('/wix/{store}/back-in-stock-import', [WixBackInStockController::class, 'import'])->name('wix.import.back.in.stock');
 
 });
-

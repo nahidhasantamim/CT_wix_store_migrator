@@ -110,6 +110,27 @@ class WixProductController extends Controller
         $allProductsResp = $this->getAllProducts($fromToken, $from);
         $products        = $allProductsResp['products'] ?? [];
 
+        // ================Specifi Product Migration===========
+        $selectedProductIds = $request->input('product_ids', []);
+        if (is_string($selectedProductIds)) {
+            $selectedProductIds = array_filter(array_map('trim', explode(',', $selectedProductIds)));
+        }
+        if (!is_array($selectedProductIds)) {
+            $selectedProductIds = [];
+        }
+
+        if (!empty($selectedProductIds)) {
+            $selectedProductIds = array_values(array_unique(array_filter($selectedProductIds)));
+            $products = array_values(array_filter($products, function ($p) use ($selectedProductIds) {
+                return isset($p['id']) && in_array($p['id'], $selectedProductIds, true);
+            }));
+
+            if (empty($products)) {
+                return back()->with('error', 'No source products matched the selected list.');
+            }
+        }
+        // ================Specifi Product Migration===========
+
         // Fetch source inventory (to attach quantities by SKU)
         $inventoryItems  = $this->queryInventoryItems($fromToken)['inventoryItems'] ?? [];
         $skuInventoryMap = [];
@@ -4662,5 +4683,39 @@ class WixProductController extends Controller
         return $s === '' ? null : $s;
     }
 
+    // ================Specifi Product Migration===========
+    public function listProductsForStore(Request $request)
+    {
+        $fromInput = (string) $request->query('from_store', '');
+        if ($fromInput === '') {
+            return response()->json(['products' => []]);
+        }
+
+        $fromStoreId = $fromInput;
+        if (is_numeric($fromInput)) {
+            $store = \App\Models\WixStore::find((int) $fromInput);
+            if ($store) {
+                $fromStoreId = $store->instance_id;
+            }
+        }
+
+        $products = \App\Models\WixProductMigration::query()
+            ->select('source_product_id', 'source_product_name')
+            ->where('from_store_id', $fromStoreId)
+            ->whereNotNull('source_product_id')
+            ->groupBy('source_product_id', 'source_product_name')
+            ->orderBy('source_product_name')
+            ->get()
+            ->map(function ($row) {
+                return [
+                    'id' => $row->source_product_id,
+                    'name' => $row->source_product_name ?: $row->source_product_id,
+                ];
+            })
+            ->values();
+
+        return response()->json(['products' => $products]);
+    }
+    // ================Specifi Product Migration===========
 
 }
