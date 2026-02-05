@@ -29,6 +29,10 @@ class WixContactController extends Controller
             'include_members'      => 'nullable|boolean',
             'include_attachments'  => 'nullable|boolean',
             'default_sub_status'   => 'nullable|string|in:SUBSCRIBED,UNSUBSCRIBED,NOT_SET',
+            'missing_only'         => 'nullable|boolean',
+            'resume_offset'        => 'nullable|integer|min:0',
+            'page_limit'           => 'nullable|integer|min:1|max:1000',
+            'batch_pages'          => 'nullable|integer|min:1',
         ]);
 
         $userId        = Auth::id() ?: 1;
@@ -38,13 +42,18 @@ class WixContactController extends Controller
         $copyMembers   = (bool) $request->boolean('include_members', true);
         $copyAttach    = (bool) $request->boolean('include_attachments', true);
         $defaultSub    = strtoupper((string) ($request->input('default_sub_status', 'SUBSCRIBED')));
+        $missingOnly   = (bool) $request->boolean('missing_only', false);
+        $resumeOffset  = (int) ($request->input('resume_offset', 0));
+        $pageLimit     = (int) ($request->input('page_limit', 1000));
+        $batchPages    = (int) ($request->input('batch_pages', 0));
 
         $fromStore = WixStore::where('instance_id', $fromStoreId)->first();
         $toStore   = WixStore::where('instance_id', $toStoreId)->first();
         $fromLabel = $fromStore?->store_name ?: $fromStoreId;
         $toLabel   = $toStore?->store_name   ?: $toStoreId;
 
-        WixHelper::log('Auto Contacts Migration', "Start (DUPLICATE-ONLY): {$fromLabel} → {$toLabel}", 'info');
+        $modeLabel = $missingOnly ? 'MISSING-ONLY' : 'ALL';
+        WixHelper::log('Auto Contacts Migration', "Start ({$modeLabel}): {$fromLabel} → {$toLabel}", 'info');
 
         // TOKENS
         $fromToken = WixHelper::getAccessToken($fromStoreId);
@@ -223,13 +232,46 @@ class WixContactController extends Controller
             return $clean($result);
         };
 
-        // Pull source contacts (FULL) and sort oldest → newest
-        $contacts = $this->getContactsFromWix($fromToken);
-        if (isset($contacts['error'])) {
-            WixHelper::log('Auto Contacts Migration', "Source API error: ".$contacts['raw'], 'error');
-            return back()->with('error', 'Failed to fetch contacts from source.');
+        // Source contacts are processed in pages (chunked + resumable)
+
+        // Missing-only mode: warm destination email/phone sets
+        $destEmailSet = [];
+        $destPhoneSet = [];
+        if ($missingOnly) {
+            $destContacts = $this->getContactsFromWix($toToken);
+            if (isset($destContacts['error'])) {
+                WixHelper::log('Auto Contacts Migration', "Destination API error: ".$destContacts['raw'], 'error');
+                return back()->with('error', 'Failed to fetch contacts from destination.');
+            }
+
+            foreach ($destContacts as $dc) {
+                $primaryEmail = $dc['primaryEmail']['email'] ?? null;
+                if ($primaryEmail) {
+                    $norm = $this->normEmail($primaryEmail);
+                    if ($norm) $destEmailSet[$norm] = true;
+                }
+                foreach (($dc['info']['emails']['items'] ?? []) as $em) {
+                    $norm = $this->normEmail($em['email'] ?? null);
+                    if ($norm) $destEmailSet[$norm] = true;
+                }
+
+                $primaryE164 = $dc['primaryPhone']['e164Phone'] ?? null;
+                if ($primaryE164) {
+                    $norm = $this->normE164($primaryE164);
+                    if ($norm) $destPhoneSet[$norm] = true;
+                }
+                foreach (($dc['info']['phones']['items'] ?? []) as $ph) {
+                    $norm = $this->normE164($ph['e164Phone'] ?? null);
+                    if ($norm) $destPhoneSet[$norm] = true;
+                }
+            }
+
+            WixHelper::log(
+                'Auto Contacts Migration',
+                'Missing-only mode: destination cache built (emails='.count($destEmailSet).', phones='.count($destPhoneSet).')',
+                'info'
+            );
         }
-        if ($max > 0) { $contacts = array_slice($contacts, 0, $max); }
 
         $createdAtMillis = function (array $item): int {
             foreach (['createdDate','dateCreated','createdAt','creationDate','date_created'] as $k) {
@@ -249,7 +291,6 @@ class WixContactController extends Controller
             }
             return PHP_INT_MAX;
         };
-        usort($contacts, fn($a, $b) => $createdAtMillis($a) <=> $createdAtMillis($b));
 
         // Source extended-field defs (for displayName mapping)
         $sourceExtDefs = $this->getAllExtendedFields($fromToken);
@@ -270,9 +311,31 @@ class WixContactController extends Controller
             'name','emails','phones','addresses','company','jobTitle',
             'birthdate','locale','extendedFields','picture','assignedUserIds'
         ];
+        $offset = $resumeOffset;
+        $processed = 0;
+        $pagesProcessed = 0;
+        $page = ['contacts' => [], 'count' => 0, 'total' => 0];
 
-        foreach ($contacts as $src) {
-            // ---------- Build filtered "info" ----------
+        do {
+            $page = $this->getContactsPageFromWix($fromToken, $pageLimit, $offset, 'Auto Contacts Migration');
+            if (isset($page['error'])) {
+                WixHelper::log('Auto Contacts Migration', "Source API error: ".$page['raw'], 'error');
+                return back()->with('error', 'Failed to fetch contacts from source.');
+            }
+
+            $contactsPage = $page['contacts'] ?? [];
+            usort($contactsPage, fn($a, $b) => $createdAtMillis($a) <=> $createdAtMillis($b));
+
+            if ($max > 0) {
+                $remaining = $max - $processed;
+                if ($remaining <= 0) { break; }
+                if (count($contactsPage) > $remaining) {
+                    $contactsPage = array_slice($contactsPage, 0, $remaining);
+                }
+            }
+
+            foreach ($contactsPage as $src) {
+                // ---------- Build filtered "info" ----------
             $info = $src['info'] ?? $src;
             $filtered = [];
             foreach ($allowedInfoKeys as $k) if (isset($info[$k])) $filtered[$k] = $info[$k];
@@ -322,6 +385,22 @@ class WixContactController extends Controller
             // Basic identity
             $email = $filtered['emails']['items'][0]['email'] ?? null;
             $name  = $filtered['name']['first'] ?? ($filtered['name']['formatted'] ?? null);
+
+            $srcEmails = [];
+            if (!empty($email)) {
+                $norm = $this->normEmail($email);
+                if ($norm) $srcEmails[] = $norm;
+            }
+            foreach (($filtered['emails']['items'] ?? []) as $em) {
+                $norm = $this->normEmail($em['email'] ?? null);
+                if ($norm && !in_array($norm, $srcEmails, true)) $srcEmails[] = $norm;
+            }
+
+            $srcPhones = [];
+            foreach (($filtered['phones']['items'] ?? []) as $ph) {
+                $norm = $this->normE164($ph['e164Phone'] ?? null);
+                if ($norm && !in_array($norm, $srcPhones, true)) $srcPhones[] = $norm;
+            }
 
             // ---------- SOURCE Marketing Consents ----------
             $mcEmails = []; $mcPhones = [];
@@ -393,6 +472,35 @@ class WixContactController extends Controller
                 continue;
             }
 
+            // ---------- Missing-only: skip if destination already has this email/phone ----------
+            if ($missingOnly) {
+                $isDuplicate = false;
+                foreach ($srcEmails as $em) {
+                    if (isset($destEmailSet[$em])) { $isDuplicate = true; break; }
+                }
+                if (!$isDuplicate) {
+                    foreach ($srcPhones as $ph) {
+                        if (isset($destPhoneSet[$ph])) { $isDuplicate = true; break; }
+                    }
+                }
+                if ($isDuplicate) {
+                    $skipped++;
+                    if ($email) {
+                        $existingRow = WixContactMigration::where('user_id', $userId)
+                            ->where('from_store_id', $fromStoreId)
+                            ->where('to_store_id', $toStoreId)
+                            ->where('contact_email', $email)
+                            ->first();
+                        if ($existingRow) {
+                            $existingRow->update([
+                                'message' => 'Skipped, as it already exists.',
+                            ]);
+                        }
+                    }
+                    continue;
+                }
+            }
+
             // ---------- ALWAYS CREATE on TARGET (labels/assigned not in body) ----------
             $created = $this->createContactInWix($toToken, $filtered);
             $targetContactId = $created['contact']['id'] ?? null;
@@ -420,6 +528,11 @@ class WixContactController extends Controller
                 }
                 WixHelper::log('Auto Contacts Migration', "Create failed (dup-mode): {$err}", 'warn');
                 continue;
+            }
+
+            if ($missingOnly) {
+                foreach ($srcEmails as $em) $destEmailSet[$em] = true;
+                foreach ($srcPhones as $ph) $destPhoneSet[$ph] = true;
             }
 
             // ---------- Assign labels now ----------
@@ -799,25 +912,45 @@ class WixContactController extends Controller
             );
         }
 
+            $processed += count($contactsPage);
+            $offset += ($page['count'] ?? count($contactsPage));
+            $pagesProcessed++;
+
+            if ($batchPages > 0 && $pagesProcessed >= $batchPages) { break; }
+            if ($max > 0 && $processed >= $max) { break; }
+        } while (($page['count'] ?? 0) > 0 && $offset < ($page['total'] ?? 0));
+
+        $hasMore = (($page['count'] ?? 0) > 0 && $offset < ($page['total'] ?? 0));
+        $nextOffset = $offset;
         $summary = "Contacts: imported={$imported}, updated={$updated}, skipped={$skipped}, failed={$failed}";
+        $resumeNote = null;
+        if ($batchPages > 0 && $hasMore) {
+            $resumeNote = "Paused after {$pagesProcessed} page(s). Resume with resume_offset={$nextOffset}.";
+            WixHelper::log('Auto Contacts Migration', $resumeNote, 'info');
+        }
 
         if ($imported + $updated > 0) {
             WixHelper::log('Auto Contacts Migration', "Done. {$summary}", $failed ? 'warn' : 'success');
             $resp = back()->with('success', "Contacts auto-migration completed. {$summary}");
             if ($failed > 0) $resp = $resp->with('warning', 'Some contacts failed to migrate. Check logs for details.');
+            if ($resumeNote) $resp = $resp->with('warning', $resumeNote);
             return $resp;
         }
 
         if ($failed > 0) {
             WixHelper::log('Auto Contacts Migration', "Done. {$summary}", 'error');
-            return back()->with('error', "No contacts imported. {$summary}");
+            $resp = back()->with('error', "No contacts imported. {$summary}");
+            if ($resumeNote) $resp = $resp->with('warning', $resumeNote);
+            return $resp;
         }
 
         $nothingNote = $skipped > 0
             ? "Nothing imported — all {$skipped} were duplicates/skipped."
             : "Nothing to import.";
         WixHelper::log('Auto Contacts Migration', "Done. {$summary}. {$nothingNote}", 'info');
-        return back()->with('success', "Contacts auto-migration completed. {$summary}. {$nothingNote}");
+        $resp = back()->with('success', "Contacts auto-migration completed. {$summary}. {$nothingNote}");
+        if ($resumeNote) $resp = $resp->with('warning', $resumeNote);
+        return $resp;
     }
 
     // ========================================================= Manual Migrator =========================================================
@@ -1064,7 +1197,6 @@ class WixContactController extends Controller
             }
             return PHP_INT_MAX;
         };
-        usort($contacts, fn($a, $b) => $createdAtMillis($a) <=> $createdAtMillis($b));
 
         if ($max > 0) {
             $contacts = array_slice($contacts, 0, $max);
@@ -1283,7 +1415,6 @@ class WixContactController extends Controller
             }
             return PHP_INT_MAX;
         };
-        usort($contacts, fn($a, $b) => $createdAtMillis($a) <=> $createdAtMillis($b));
         if ($max > 0) {
             $contacts = array_slice($contacts, 0, $max);
             WixHelper::log('Import Contacts', "Applied max={$max}, importing ".count($contacts)." contact(s).", 'info');
@@ -2038,6 +2169,48 @@ class WixContactController extends Controller
         return $contacts;
     }
 
+    private function getContactsPageFromWix(string $accessToken, int $limit, int $offset, string $logAction = 'Export Contacts'): array
+    {
+        $query = [
+            'paging.limit'  => $limit,
+            'paging.offset' => $offset,
+            'fieldsets'     => 'FULL'
+        ];
+
+        $response = Http::withHeaders([
+            'Authorization' => $accessToken,
+            'Content-Type'  => 'application/json'
+        ])->get('https://www.wixapis.com/contacts/v4/contacts', $query);
+
+        WixHelper::log($logAction, 'Query page received: status='.$response->status().', offset='.$offset, 'info');
+
+        if (!$response->ok()) {
+            WixHelper::log($logAction, "API error: " . $response->body(), 'error');
+            return [
+                'error' => 'Failed to fetch contacts from Wix.',
+                'raw' => $response->body()
+            ];
+        }
+
+        $data = $response->json();
+        if (!isset($data['contacts'])) {
+            WixHelper::log($logAction, "API error: " . json_encode($data), 'error');
+            return [
+                'error' => 'Failed to fetch contacts from Wix.',
+                'raw' => json_encode($data)
+            ];
+        }
+
+        $count = $data['pagingMetadata']['count'] ?? count($data['contacts']);
+        $total = $data['pagingMetadata']['total'] ?? PHP_INT_MAX;
+
+        return [
+            'contacts' => $data['contacts'],
+            'count' => $count,
+            'total' => $total,
+        ];
+    }
+
     private function cleanEmpty($array)
     {
         foreach ($array as $k => $v) {
@@ -2788,8 +2961,8 @@ class WixContactController extends Controller
 
 
     /**
-     * Compare source (from_store) and destination (to_store) contacts.
-     * If destination missing any → export missing ones in JSON.
+     * Compare source (store) contacts vs successful migration rows.
+     * Export contacts that are missing in DB (no success row).
      */
     public function compareAndExportMissingContacts(WixStore $store)
     {
@@ -2798,71 +2971,50 @@ class WixContactController extends Controller
             return back()->with('error', 'Unauthorized store access.');
         }
 
-        $toStoreId = $store->instance_id;
-
-        // Find first matching from_store_id for this to_store
-        $migrationRecord = WixContactMigration::where('to_store_id', $toStoreId)->first();
-        if (!$migrationRecord) {
-            return back()->with('error', 'No source store found for this destination store.');
-        }
-
-        $fromStoreId = $migrationRecord->from_store_id;
-        $fromStore = WixStore::where('instance_id', $fromStoreId)->first();
-        if (!$fromStore) {
-            return back()->with('error', 'Source store not found.');
-        }
+        $fromStoreId = $store->instance_id;
+        $fromStore   = $store;
 
         WixHelper::log('ContactCompare', [
             'from_store' => $fromStore->store_name,
-            'to_store'   => $store->store_name,
-            'msg'        => 'Starting contact comparison between source and destination stores',
+            'msg'        => 'Starting contact comparison between source store and DB success rows',
         ]);
 
-        // Fetch all contacts from both stores
+        // Fetch all contacts from source store
         $sourceAccessToken = WixHelper::getAccessToken($fromStore->instance_id);
-        $destAccessToken   = WixHelper::getAccessToken($store->instance_id);
 
         $sourceContacts = $this->getContactsFromWix($sourceAccessToken);
-        $destContacts   = $this->getContactsFromWix($destAccessToken);
 
         if (empty($sourceContacts)) {
             return back()->with('error', 'No contacts found in source store.');
         }
 
-        // Normalize email lists
-        $sourceEmails = collect($sourceContacts)
-            ->pluck('info.emails.0.email')
+        // Success emails already in DB
+        $successEmails = WixContactMigration::where('user_id', Auth::id())
+            ->where('from_store_id', $fromStoreId)
+            ->where('status', 'success')
+            ->pluck('contact_email')
             ->filter()
             ->map(fn($e) => strtolower(trim($e)))
             ->unique()
             ->values()
             ->toArray();
 
-        $destEmails = collect($destContacts)
-            ->pluck('info.emails.0.email')
-            ->filter()
-            ->map(fn($e) => strtolower(trim($e)))
-            ->unique()
-            ->values()
-            ->toArray();
+        $successSet = array_flip($successEmails);
 
-        // Compare and find missing
-        $missingEmails = array_diff($sourceEmails, $destEmails);
+        // Find contacts that are missing in DB
+        $missingContacts = collect($sourceContacts)->filter(function ($contact) use ($successSet) {
+            $email = strtolower(trim($contact['info']['emails'][0]['email'] ?? ''));
+            if (!$email) return false;
+            return !isset($successSet[$email]);
+        })->values()->toArray();
 
-        if (empty($missingEmails)) {
+        if (empty($missingContacts)) {
             WixHelper::log('ContactCompare', [
                 'from_store' => $fromStore->store_name,
-                'to_store'   => $store->store_name,
-                'msg'        => 'All contacts exist in destination store',
+                'msg'        => 'All contacts exist in DB with success status',
             ]);
-            return back()->with('success', 'All contacts are already synced between both stores.');
+            return back()->with('success', 'All contacts are already marked as success in DB.');
         }
-
-        // Collect full info for missing contacts
-        $missingContacts = collect($sourceContacts)->filter(function ($contact) use ($missingEmails) {
-            $email = strtolower($contact['info']['emails'][0]['email'] ?? '');
-            return in_array($email, $missingEmails);
-        })->values()->toArray();
 
         // Export to JSON file
         $filename = 'missing_contacts_' . now()->format('Ymd_His') . '.json';
@@ -2875,10 +3027,9 @@ class WixContactController extends Controller
 
         WixHelper::log('ContactCompare', [
             'from_store' => $fromStore->store_name,
-            'to_store'   => $store->store_name,
             'missing_count' => count($missingContacts),
             'file' => $filename,
-            'msg' => 'Exported missing contacts from source store',
+            'msg' => 'Exported contacts missing from DB success rows',
         ]);
 
         return back()->with('success', "Found " . count($missingContacts) . " missing contacts. Exported to {$filename}");
@@ -3102,3 +3253,12 @@ class WixContactController extends Controller
 
 
 }
+
+
+
+
+
+
+
+
+

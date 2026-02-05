@@ -338,7 +338,7 @@ class WixGiftCardController extends Controller
     // =========================================================
     // Export Gift Cards (append-only, oldest-first)
     // =========================================================
-    public function export(WixStore $store)
+    public function export(WixStore $store, Request $request)
     {
         $userId      = Auth::id() ?: 1;
         $fromStoreId = $store->instance_id;
@@ -371,7 +371,53 @@ class WixGiftCardController extends Controller
             return PHP_INT_MAX;
         };
 
-        $resp = $this->getGiftCardsFromWix($accessToken);
+        $normalizeDate = function (?string $raw): ?string {
+            $raw = $raw !== null ? trim($raw) : null;
+            if ($raw === null || $raw === '') return null;
+
+            // Accept epoch seconds or milliseconds
+            if (is_numeric($raw)) {
+                $n = (int)$raw;
+                if ($n > 9999999999) { // assume ms
+                    $n = (int) floor($n / 1000);
+                }
+                $dt = (new \DateTimeImmutable('@'.$n))->setTimezone(new \DateTimeZone('UTC'));
+                return $dt->format('Y-m-d\TH:i:s.v\Z');
+            }
+
+            try {
+                $dt = new \DateTimeImmutable($raw);
+                $dt = $dt->setTimezone(new \DateTimeZone('UTC'));
+                return $dt->format('Y-m-d\TH:i:s.v\Z');
+            } catch (\Exception $e) {
+                return null;
+            }
+        };
+
+        $limit = (int) $request->input('limit', 100);
+        if ($limit < 1) $limit = 1;
+        if ($limit > 100) $limit = 100;
+
+        $createdFromRaw = $request->input('created_from') ?: $request->input('from_date');
+        $createdToRaw   = $request->input('created_to') ?: $request->input('to_date');
+        $createdFrom    = $normalizeDate($createdFromRaw);
+        $createdTo      = $normalizeDate($createdToRaw);
+
+        if ($createdFromRaw && !$createdFrom) {
+            return back()->with('error', 'Invalid created_from date.');
+        }
+        if ($createdToRaw && !$createdTo) {
+            return back()->with('error', 'Invalid created_to date.');
+        }
+
+        $queryOptions = [
+            'limit'        => $limit,
+            'created_from' => $createdFrom,
+            'created_to'   => $createdTo,
+            'sort_order'   => 'ASC',
+        ];
+
+        $resp = $this->getGiftCardsFromWix($accessToken, $queryOptions);
         if (!isset($resp['giftCards']) || !is_array($resp['giftCards'])) {
             WixHelper::log('Export Gift Cards', 'API error: '.json_encode($resp), 'error');
             return response()->json(['error' => 'Failed to fetch gift cards from Wix.'], 500);
@@ -648,16 +694,38 @@ class WixGiftCardController extends Controller
     // =========================================================
     // Utilities (kept as requested)
     // =========================================================
-    public function getGiftCardsFromWix($accessToken)
+    public function getGiftCardsFromWix($accessToken, ?array $queryOptions = null)
     {
         $ensureBearer = fn(string $t) => preg_match('/^Bearer\s+/i', $t) ? $t : ('Bearer '.$t);
 
         $endpoint = 'https://www.wixapis.com/gift-cards/v1/gift-cards/query';
         $all      = [];
         $cursor   = null;
+        $queryOptions = $queryOptions ?? [];
+        $limit = isset($queryOptions['limit']) ? (int)$queryOptions['limit'] : 100;
+        if ($limit < 1) $limit = 1;
+        if ($limit > 100) $limit = 100;
+
+        $query = [
+            'cursorPaging' => ['limit' => $limit],
+        ];
+
+        $createdFilter = [];
+        if (!empty($queryOptions['created_from'])) $createdFilter['$gte'] = $queryOptions['created_from'];
+        if (!empty($queryOptions['created_to']))   $createdFilter['$lte'] = $queryOptions['created_to'];
+        if ($createdFilter) {
+            $query['filter']['createdDate'] = $createdFilter;
+        }
+
+        if (!empty($queryOptions['sort_order'])) {
+            $query['sort'] = [[
+                'fieldName' => 'createdDate',
+                'order'     => strtoupper($queryOptions['sort_order']) === 'DESC' ? 'DESC' : 'ASC',
+            ]];
+        }
 
         do {
-            $body = ['query' => ['cursorPaging' => ['limit' => 100]]];
+            $body = ['query' => $query];
             if ($cursor) $body['query']['cursorPaging']['cursor'] = $cursor;
 
             $response = Http::withHeaders([

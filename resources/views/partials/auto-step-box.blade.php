@@ -75,6 +75,44 @@
         </div>
       </div>
 
+      {{-- Contacts-specific options --}}
+      @if (($cfg['key'] ?? null) === 'contacts_members_auto')
+        <div class="mt-2 space-y-3">
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div>
+              <label for="auto_contacts_batch_pages_{{ $idx }}" class="block mb-1 text-xs font-medium text-gray-900 dark:text-gray-300">
+                Batch pages (optional)
+              </label>
+              <input type="number" min="1" name="batch_pages" id="auto_contacts_batch_pages_{{ $idx }}"
+                    class="w-full rounded-md border border-gray-300 bg-gray-50 px-3 py-2 text-sm text-gray-900 focus:border-blue-500 focus:ring-blue-500
+                           dark:bg-gray-700 dark:border-gray-600 dark:text-white"
+                    placeholder="e.g. 5">
+            </div>
+            <div>
+              <label for="auto_contacts_resume_offset_{{ $idx }}" class="block mb-1 text-xs font-medium text-gray-900 dark:text-gray-300">
+                Resume offset (optional)
+              </label>
+              <input type="number" min="0" name="resume_offset" id="auto_contacts_resume_offset_{{ $idx }}"
+                    class="w-full rounded-md border border-gray-300 bg-gray-50 px-3 py-2 text-sm text-gray-900 focus:border-blue-500 focus:ring-blue-500
+                           dark:bg-gray-700 dark:border-gray-600 dark:text-white"
+                    placeholder="e.g. 10000">
+            </div>
+            <div>
+              <label for="auto_contacts_page_limit_{{ $idx }}" class="block mb-1 text-xs font-medium text-gray-900 dark:text-gray-300">
+                Page size (optional)
+              </label>
+              <input type="number" min="1" max="1000" name="page_limit" id="auto_contacts_page_limit_{{ $idx }}"
+                    class="w-full rounded-md border border-gray-300 bg-gray-50 px-3 py-2 text-sm text-gray-900 focus:border-blue-500 focus:ring-blue-500
+                           dark:bg-gray-700 dark:border-gray-600 dark:text-white"
+                    placeholder="1000">
+            </div>
+          </div>
+          <p class="text-[11px] text-gray-500 dark:text-gray-400">
+            Use batch pages to run in smaller chunks. If it pauses, use the shown resume offset to continue.
+          </p>
+        </div>
+      @endif
+
       {{-- Products-specific options --}}
       @if (($cfg['key'] ?? null) === 'products_auto')
         <!-- ================Specifi Product Migration=========== -->
@@ -313,6 +351,17 @@
                        dark:bg-blue-600 dark:hover:bg-blue-700 dark:focus:ring-blue-800">
             Start Migration
           </button>
+          @if (($cfg['key'] ?? null) === 'contacts_members_auto')
+          <button
+              type="submit"
+              name="missing_only"
+              value="1"
+              class="text-white bg-green-700 hover:bg-green-800 focus:ring-4 focus:outline-none focus:ring-green-300 font-medium rounded-lg text-sm px-5 py-2.5
+                     dark:bg-green-600 dark:hover:bg-green-700 dark:focus:ring-green-800"
+          >
+              Migrate Missing Only
+          </button>
+          @endif
           @if (($cfg['key'] ?? null) === 'categories_auto')
           <button
               type="submit"

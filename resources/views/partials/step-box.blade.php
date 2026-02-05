@@ -252,9 +252,9 @@
                     {{-- Limit --}}
                     <div>
                       <label class="block text-xs text-gray-300 mb-1">Max Gift Cards (optional)</label>
-                      <input type="number" min="1" name="limit"
+                      <input type="number" min="1" max="100" name="limit"
                             class="w-full rounded-md border border-gray-600 bg-gray-900 px-3 py-2 text-sm text-gray-100"
-                            placeholder="e.g. 200">
+                            placeholder="e.g. 100">
                     </div>
 
                     <button type="submit"
