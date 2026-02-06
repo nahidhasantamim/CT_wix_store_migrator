@@ -2961,6 +2961,454 @@ class WixContactController extends Controller
 
 
     /**
+     * Compare contacts between two Wix stores and export those missing in destination.
+     * Uses email/phone matching similar to migrateAuto missing-only mode.
+     */
+    public function exportMissingContactsBetweenStores(Request $request)
+    {
+        $request->validate([
+            'from_store'          => 'required|string',
+            'to_store'            => 'required|string|different:from_store',
+            'max'                 => 'nullable|integer|min:1',
+            'include_members'     => 'nullable|boolean',
+            'include_attachments' => 'nullable|boolean',
+            'page_limit'          => 'nullable|integer|min:1|max:1000',
+        ]);
+
+        $userId        = Auth::id() ?: 1;
+        $fromStoreId   = (string) $request->input('from_store');
+        $toStoreId     = (string) $request->input('to_store');
+        $max           = (int) ($request->input('max', 0));
+        $copyMembers   = (bool) $request->boolean('include_members', true);
+        $copyAttach    = (bool) $request->boolean('include_attachments', true);
+        $pageLimit     = (int) ($request->input('page_limit', 1000));
+
+        $fromStore = WixStore::where('instance_id', $fromStoreId)->first();
+        $toStore   = WixStore::where('instance_id', $toStoreId)->first();
+
+        if (!$fromStore || !$toStore || $fromStore->user_id !== Auth::id() || $toStore->user_id !== Auth::id()) {
+            return back()->with('error', 'Unauthorized store access.');
+        }
+
+        WixHelper::log('ContactCompare', [
+            'from_store' => $fromStore->store_name,
+            'to_store'   => $toStore->store_name,
+            'msg'        => 'Starting contact comparison between source and destination stores',
+        ]);
+
+        $fromToken = WixHelper::getAccessToken($fromStoreId);
+        $toToken   = WixHelper::getAccessToken($toStoreId);
+        if (!$fromToken || !$toToken) {
+            return back()->with('error', 'Could not get Wix access token(s).');
+        }
+
+        // ---- Build destination email/phone sets (paged) ----
+        $destEmailSet = [];
+        $destPhoneSet = [];
+        $offset = 0;
+        do {
+            $page = $this->getContactsPageFromWix($toToken, $pageLimit, $offset, 'Compare Missing Contacts');
+            if (isset($page['error'])) {
+                WixHelper::log('ContactCompare', "Destination API error: " . $page['raw'], 'error');
+                return back()->with('error', 'Failed to fetch contacts from destination.');
+            }
+
+            foreach (($page['contacts'] ?? []) as $dc) {
+                $primaryEmail = $dc['primaryEmail']['email'] ?? null;
+                if ($primaryEmail) {
+                    $norm = $this->normEmail($primaryEmail);
+                    if ($norm) $destEmailSet[$norm] = true;
+                }
+                foreach (($dc['info']['emails']['items'] ?? []) as $em) {
+                    $norm = $this->normEmail($em['email'] ?? null);
+                    if ($norm) $destEmailSet[$norm] = true;
+                }
+
+                $primaryE164 = $dc['primaryPhone']['e164Phone'] ?? null;
+                if ($primaryE164) {
+                    $norm = $this->normE164($primaryE164);
+                    if ($norm) $destPhoneSet[$norm] = true;
+                }
+                foreach (($dc['info']['phones']['items'] ?? []) as $ph) {
+                    $norm = $this->normE164($ph['e164Phone'] ?? null);
+                    if ($norm) $destPhoneSet[$norm] = true;
+                }
+            }
+
+            $offset += ($page['count'] ?? 0);
+        } while (($page['count'] ?? 0) > 0 && $offset < ($page['total'] ?? 0));
+
+        WixHelper::log('ContactCompare', 'Destination cache built: emails=' . count($destEmailSet) . ', phones=' . count($destPhoneSet), 'info');
+
+        // ---- Collect missing source contacts (paged) ----
+        $missingContacts = [];
+        $offset = 0;
+        $stop = false;
+
+        do {
+            $page = $this->getContactsPageFromWix($fromToken, $pageLimit, $offset, 'Compare Missing Contacts');
+            if (isset($page['error'])) {
+                WixHelper::log('ContactCompare', "Source API error: " . $page['raw'], 'error');
+                return back()->with('error', 'Failed to fetch contacts from source.');
+            }
+
+            foreach (($page['contacts'] ?? []) as $sc) {
+                $emails = [];
+                $phones = [];
+
+                $primaryEmail = $sc['primaryEmail']['email'] ?? null;
+                if ($primaryEmail) {
+                    $norm = $this->normEmail($primaryEmail);
+                    if ($norm) $emails[] = $norm;
+                }
+                foreach (($sc['info']['emails']['items'] ?? []) as $em) {
+                    $norm = $this->normEmail($em['email'] ?? null);
+                    if ($norm && !in_array($norm, $emails, true)) $emails[] = $norm;
+                }
+
+                $primaryE164 = $sc['primaryPhone']['e164Phone'] ?? null;
+                if ($primaryE164) {
+                    $norm = $this->normE164($primaryE164);
+                    if ($norm) $phones[] = $norm;
+                }
+                foreach (($sc['info']['phones']['items'] ?? []) as $ph) {
+                    $norm = $this->normE164($ph['e164Phone'] ?? null);
+                    if ($norm && !in_array($norm, $phones, true)) $phones[] = $norm;
+                }
+
+                $exists = false;
+                foreach ($emails as $e) {
+                    if (isset($destEmailSet[$e])) { $exists = true; break; }
+                }
+                if (!$exists) {
+                    foreach ($phones as $p) {
+                        if (isset($destPhoneSet[$p])) { $exists = true; break; }
+                    }
+                }
+
+                if (!$exists) {
+                    $missingContacts[] = $sc;
+                    if ($max > 0 && count($missingContacts) >= $max) {
+                        $stop = true;
+                        break;
+                    }
+                }
+            }
+
+            $offset += ($page['count'] ?? 0);
+        } while (!$stop && ($page['count'] ?? 0) > 0 && $offset < ($page['total'] ?? 0));
+
+        if (empty($missingContacts)) {
+            WixHelper::log('ContactCompare', [
+                'from_store' => $fromStore->store_name,
+                'to_store'   => $toStore->store_name,
+                'msg'        => 'All contacts already exist in destination store',
+            ]);
+            return back()->with('success', 'All contacts already exist in the destination store.');
+        }
+
+        // -------- Query ALL labels once & build catalogs (same as export) --------
+        $queryAllLabels = function (string $token): array {
+            $all = []; $offset = 0; $limit = 1000;
+            do {
+                $payload = [
+                    'query' => [
+                        'filter' => (object)[],
+                        'paging' => ['limit' => $limit, 'offset' => $offset],
+                        'sort'   => [['fieldName' => 'displayName', 'order' => 'ASC']]
+                    ]
+                ];
+                $resp = Http::withHeaders([
+                    'Authorization' => $token,
+                    'Content-Type'  => 'application/json',
+                ])->post('https://www.wixapis.com/contacts/v4/labels/query', $payload);
+
+                WixHelper::log('Labels:Query', "offset={$offset} status={$resp->status()}", $resp->ok() ? 'info' : 'warn');
+                if (!$resp->ok()) break;
+
+                $json   = $resp->json();
+                $labels = $json['labels'] ?? [];
+                foreach ($labels as $l) $all[] = $l;
+
+                $count  = $json['pagingMetadata']['count'] ?? count($labels);
+                $total  = $json['pagingMetadata']['total'] ?? null;
+                $offset += $count;
+                if ($total !== null && $offset >= $total) break;
+            } while (true);
+            return $all;
+        };
+
+        // key => displayName catalog
+        $labelMap = [];
+        foreach ($queryAllLabels($fromToken) as $L) {
+            $key = $L['key'] ?? null;
+            $dn  = $L['displayName'] ?? null;
+            if ($key && $dn) $labelMap[$key] = $dn;
+        }
+        WixHelper::log('Labels:Query', 'total=' . count($labelMap), 'info');
+
+        // --- Extended Field defs (for humanized list) ---
+        $extendedFieldDefs = $this->getAllExtendedFields($fromToken);
+
+        // ===== Transform contacts (FULL, same as export) =====
+        foreach ($missingContacts as &$contact) {
+            if (!isset($contact['info'])) { $contact['info'] = []; }
+            $contact['info']['_old_id'] = $contact['id'] ?? null;
+
+            // Resolve label KEYS from both possible shapes
+            $keys = [];
+            if (!empty($contact['labelKeys'])) {
+                $keys = is_array($contact['labelKeys']) && isset($contact['labelKeys']['items'])
+                    ? (array) $contact['labelKeys']['items']
+                    : (array) $contact['labelKeys'];
+            }
+            if (empty($keys) && !empty($contact['info']['labelKeys']['items'])) {
+                $keys = (array) $contact['info']['labelKeys']['items'];
+            }
+
+            // Labels => humanized for import
+            $contact['labels'] = [];
+            foreach ($keys as $key) {
+                $contact['labels'][] = [
+                    'key'         => $key,
+                    'displayName' => $labelMap[$key] ?? $key,
+                ];
+            }
+
+            // Extended fields (user-defined only for humanized list; raw info.extendedFields stays intact)
+            $contact['extendedFields'] = [];
+            $items = $contact['info']['extendedFields']['items'] ?? [];
+            foreach ($items as $key => $value) {
+                $def = $extendedFieldDefs[$key] ?? null;
+                if (!isset($def['dataType']) || !isset($def['displayName'])) continue;
+                if ($this->isSystemExtendedField($def['displayName'])) continue;
+                $contact['extendedFields'][] = [
+                    'key'         => $key,
+                    'displayName' => $def['displayName'],
+                    'dataType'    => $def['dataType'],
+                    'value'       => $value,
+                ];
+            }
+
+            // Attachments (toggle)
+            $contact['attachments'] = [];
+            if ($copyAttach && !empty($contact['id'])) {
+                $atts = $this->listContactAttachments($fromToken, $contact['id']);
+                foreach ($atts as $att) {
+                    $attFile = $this->downloadContactAttachment($fromToken, $contact['id'], $att['id']);
+                    $contact['attachments'][] = [
+                        'fileName'       => $att['fileName'],
+                        'mimeType'       => $att['mimeType'],
+                        'meta'           => $att,
+                        'content_base64' => isset($attFile['content']) ? base64_encode($attFile['content']) : null
+                    ];
+                }
+            }
+
+            // Notes
+            $contactId = $contact['id'] ?? null;
+            $contact['notes'] = $contactId ? $this->getContactNotes($fromToken, $contactId) : [];
+
+            // Member (toggle)
+            $contact['member'] = null;
+            if ($copyMembers && $contactId) {
+                $member = $this->findMemberByContactId($fromToken, $contactId);
+                if ($member) {
+                    $memberId = $member['id'];
+                    $contact['member'] = [
+                        'id'                 => $memberId,
+                        'loginEmail'         => $member['loginEmail'] ?? null,
+                        'profile'            => $member['profile'] ?? null,
+                        'customFields'       => $member['customFields'] ?? null,
+                        'followers'          => $this->getMemberFollowers($fromToken, $memberId, 'followers'),
+                        'following'          => $this->getMemberFollowers($fromToken, $memberId, 'following'),
+                        'badges'             => $this->getMemberBadges($fromToken, $memberId),
+                        'activity_counters'  => $this->getMemberActivityCounters($fromToken, $memberId),
+                    ];
+                    $memberAbout = $this->getMemberAbout($fromToken, $memberId);
+                    if ($memberAbout) $contact['member']['about'] = $memberAbout;
+                }
+            }
+
+            // Marketing Consent (emails + phones)
+            $mcEmails = []; $mcPhones = [];
+            $primaryEmail = $contact['primaryEmail']['email'] ?? null;
+            if ($primaryEmail) {
+                $mc = $this->getMarketingConsentByEmail($fromToken, $this->normEmail($primaryEmail));
+                if ($mc) $mcEmails[$this->normEmail($primaryEmail)] = $mc;
+            }
+            foreach (($contact['info']['emails']['items'] ?? []) as $em) {
+                $e = $this->normEmail($em['email'] ?? null);
+                if ($e && !isset($mcEmails[$e])) {
+                    $mc = $this->getMarketingConsentByEmail($fromToken, $e);
+                    if ($mc) $mcEmails[$e] = $mc;
+                }
+            }
+            $primaryE164 = $contact['primaryPhone']['e164Phone'] ?? null;
+            if ($primaryE164) {
+                $normPhone = $this->normE164($primaryE164);
+                if ($normPhone) {
+                    $mc = $this->getMarketingConsentByPhoneE164($fromToken, $normPhone);
+                    if ($mc) $mcPhones[$normPhone] = $mc;
+                }
+            }
+            foreach (($contact['info']['phones']['items'] ?? []) as $ph) {
+                $e164 = $this->normE164($ph['e164Phone'] ?? null);
+                if ($e164 && !isset($mcPhones[$e164])) {
+                    $mc = $this->getMarketingConsentByPhoneE164($fromToken, $e164);
+                    if ($mc) $mcPhones[$e164] = $mc;
+                }
+            }
+            $contact['marketingConsent'] = ['emails' => $mcEmails, 'phones' => $mcPhones];
+        }
+        unset($contact);
+
+        // Append-only pending rows
+        $pendingSaved = 0;
+        foreach ($missingContacts as $c) {
+            $email = $c['info']['emails']['items'][0]['email'] ?? null;
+            $name  = $c['info']['name']['first'] ?? ($c['info']['name']['formatted'] ?? null);
+            if (!$email) {
+                WixHelper::log('Export Contacts', 'Skipped pending row: contact has no email.', 'warn');
+                continue;
+            }
+            WixContactMigration::create([
+                'user_id'                 => $userId,
+                'from_store_id'           => $fromStoreId,
+                'to_store_id'             => null,
+                'contact_email'           => $email,
+                'contact_name'            => $name,
+                'destination_contact_id'  => null,
+                'status'                  => 'pending',
+                'error_message'           => null,
+            ]);
+            $pendingSaved++;
+        }
+
+        // Members custom fields meta
+        $customFields = $this->getAllCustomFields($fromToken);
+        $customFieldIds = array_map(fn($f) => $f['id'], $customFields);
+        $customFieldApplications = $this->getCustomFieldApplications($fromToken, $customFieldIds);
+
+        $payload = [
+            'tokem'                    => $fromToken,
+            'from_store_id'            => $fromStoreId,
+            'contacts'                 => $missingContacts,
+            'customFields'             => $customFields,
+            'customFieldApplications'  => $customFieldApplications,
+            'labels_catalog'           => $labelMap,
+            '_export_meta'             => [
+                'include_members'     => $copyMembers,
+                'include_attachments' => $copyAttach,
+                'max'                 => $max,
+                'compare_to_store_id' => $toStoreId,
+                'exported_at'         => now()->toIso8601String(),
+            ],
+        ];
+
+        WixHelper::log('ContactCompare', "Done. Exported " . count($missingContacts) . " missing contact(s); saved {$pendingSaved} pending row(s).", 'success');
+
+        return response()->streamDownload(function() use ($payload) {
+            echo json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+        }, 'contacts_missing_between_stores.json', ['Content-Type' => 'application/json']);
+    }
+
+    /**
+     * Delete contacts in a target store using an exported JSON file.
+     * Expects a JSON with "contacts" array (like export files).
+     */
+    public function deleteContactsByJson(Request $request)
+    {
+        $request->validate([
+            'to_store'      => 'required|string',
+            'contacts_json' => 'required|file',
+            'confirm'       => 'nullable|boolean',
+            'dry_run'       => 'nullable|boolean',
+        ]);
+
+        if (!$request->boolean('confirm')) {
+            return back()->with('error', 'Please confirm deletion.');
+        }
+
+        $toStoreId = (string) $request->input('to_store');
+        $toStore   = WixStore::where('instance_id', $toStoreId)->first();
+        if (!$toStore || $toStore->user_id !== Auth::id()) {
+            return back()->with('error', 'Unauthorized store access.');
+        }
+
+        $accessToken = WixHelper::getAccessToken($toStoreId);
+        if (!$accessToken) {
+            return back()->with('error', 'Could not get Wix access token.');
+        }
+
+        $file = $request->file('contacts_json');
+        $json = file_get_contents($file->getRealPath());
+        $decoded = json_decode($json, true);
+
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            return back()->with('error', 'Invalid JSON file.');
+        }
+
+        $contacts = [];
+        if (isset($decoded['contacts']) && is_array($decoded['contacts'])) {
+            $contacts = $decoded['contacts'];
+        } elseif (isset($decoded[0]) && is_array($decoded[0])) {
+            // accept raw array of contacts
+            $contacts = $decoded;
+        }
+
+        if (empty($contacts)) {
+            return back()->with('error', 'No contacts found in JSON.');
+        }
+
+        $dryRun = $request->boolean('dry_run', false);
+        $deleted = 0;
+        $failed  = 0;
+        $skipped = 0;
+
+        foreach ($contacts as $c) {
+            $contactId = $c['id'] ?? ($c['contact']['id'] ?? null);
+            if (!$contactId) {
+                $skipped++;
+                continue;
+            }
+
+            if ($dryRun) {
+                $deleted++;
+                continue;
+            }
+
+            try {
+                $resp = Http::withToken($accessToken)
+                    ->delete("https://www.wixapis.com/contacts/v4/contacts/{$contactId}");
+
+                if ($resp->successful()) {
+                    $deleted++;
+                } else {
+                    $failed++;
+                    WixHelper::log('ContactDelete', [
+                        'contact_id' => $contactId,
+                        'status' => $resp->status(),
+                        'body' => $resp->body(),
+                    ]);
+                }
+            } catch (\Throwable $e) {
+                $failed++;
+                WixHelper::log('ContactDelete', [
+                    'contact_id' => $contactId,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        $msg = $dryRun
+            ? "Dry run only. Would delete {$deleted} contact(s). Skipped {$skipped} (missing id)."
+            : "Deletion complete. Deleted {$deleted}, failed {$failed}, skipped {$skipped}.";
+
+        return back()->with('success', $msg);
+    }
+
+    /**
      * Compare source (store) contacts vs successful migration rows.
      * Export contacts that are missing in DB (no success row).
      */

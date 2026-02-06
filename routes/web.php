@@ -113,6 +113,10 @@ Route::middleware('auth')->group(function () {
     Route::post('/stores/{store}/contacts/compare-and-export', 
         [WixContactController::class, 'compareAndExportMissingContacts']
     )->name('wix.contacts.compare.export');
+    Route::post('/wix/contacts/export-missing-between', [WixContactController::class, 'exportMissingContactsBetweenStores'])
+        ->name('wix.contacts.export.missing.between');
+    Route::post('/wix/contacts/delete-by-json', [WixContactController::class, 'deleteContactsByJson'])
+        ->name('wix.contacts.delete.by.json');
     Route::post('/wix/contacts/sync-destination/{store}', [WixContactController::class, 'syncDestinationContacts'])
         ->name('wix.contacts.syncDestination');
     Route::match(['GET', 'POST'], '/stores/{store}/contacts/cleanup-orphans', 

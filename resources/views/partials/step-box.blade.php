@@ -436,6 +436,160 @@
       </x-modal>
     @endforeach
   </div>
+
+  @if ($title === 'Contacts & Members')
+    <div class="w-full bg-white border border-gray-200 shadow-sm dark:bg-gray-900 dark:border-gray-700 p-5 rounded-md mt-6">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="text-base sm:text-lg font-semibold text-gray-900 dark:text-white">
+          Compare Between Stores (Export Missing)
+        </h3>
+      </div>
+
+      <form action="{{ route('wix.contacts.export.missing.between') }}" method="POST" class="space-y-6">
+        @csrf
+
+        <div class="flex gap-4 max-sm:flex-col">
+          <div class="sm:w-1/2 w-full">
+            <label for="compare_from_store_{{ $idx }}" class="block mb-2 text-sm font-medium text-gray-900 dark:text-white">
+              From Store
+            </label>
+            <select id="compare_from_store_{{ $idx }}" name="from_store" required
+                    class="bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5
+                           dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-blue-500 dark:focus:border-blue-500">
+              <option value="" selected disabled>Select Store</option>
+              @foreach($stores as $s)
+                <option value="{{ $s->instance_id }}">
+                  {{ $s->store_name }} ({{ \Illuminate\Support\Str::limit($s->instance_id, 30, '...') }})
+                </option>
+              @endforeach
+            </select>
+          </div>
+
+          <div class="sm:w-1/2 w-full">
+            <label for="compare_to_store_{{ $idx }}" class="block mb-2 text-sm font-medium text-gray-900 dark:text-white">
+              To Store
+            </label>
+            <select id="compare_to_store_{{ $idx }}" name="to_store" required
+                    class="bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5
+                           dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-blue-500 dark:focus:border-blue-500">
+              <option value="" selected disabled>Select Store</option>
+              @foreach($stores as $s)
+                <option value="{{ $s->instance_id }}">
+                  {{ $s->store_name }} ({{ \Illuminate\Support\Str::limit($s->instance_id, 30, '...') }})
+                </option>
+              @endforeach
+            </select>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div>
+            <label for="compare_max_{{ $idx }}" class="block mb-1 text-xs font-medium text-gray-900 dark:text-gray-300">
+              Max (optional)
+            </label>
+            <input type="number" min="1" name="max" id="compare_max_{{ $idx }}"
+                  class="w-full rounded-md border border-gray-300 bg-gray-50 px-3 py-2 text-sm text-gray-900 focus:border-blue-500 focus:ring-blue-500
+                         dark:bg-gray-700 dark:border-gray-600 dark:text-white"
+                  placeholder="e.g. 500">
+          </div>
+          <div>
+            <label for="compare_page_limit_{{ $idx }}" class="block mb-1 text-xs font-medium text-gray-900 dark:text-gray-300">
+              Page Size
+            </label>
+            <input type="number" min="1" max="1000" name="page_limit" id="compare_page_limit_{{ $idx }}"
+                  class="w-full rounded-md border border-gray-300 bg-gray-50 px-3 py-2 text-sm text-gray-900 focus:border-blue-500 focus:ring-blue-500
+                         dark:bg-gray-700 dark:border-gray-600 dark:text-white"
+                  placeholder="1000">
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <label class="inline-flex items-center gap-2 text-sm text-gray-900 dark:text-gray-200">
+            <input type="checkbox" name="include_members" value="1"
+                  class="h-4 w-4 rounded border-gray-300 bg-gray-50 text-blue-600 focus:ring-blue-500
+                         dark:bg-gray-700 dark:border-gray-600" checked>
+            Include Members
+          </label>
+          <label class="inline-flex items-center gap-2 text-sm text-gray-900 dark:text-gray-200">
+            <input type="checkbox" name="include_attachments" value="1"
+                  class="h-4 w-4 rounded border-gray-300 bg-gray-50 text-blue-600 focus:ring-blue-500
+                         dark:bg-gray-700 dark:border-gray-600" checked>
+            Include Attachments
+          </label>
+        </div>
+
+        <button type="submit"
+                class="inline-flex items-center justify-center rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500/60">
+          Export Missing Contacts
+        </button>
+      </form>
+    </div>
+
+    <div class="w-full bg-white border border-gray-200 shadow-sm dark:bg-gray-900 dark:border-gray-700 p-5 rounded-md mt-4">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="text-base sm:text-lg font-semibold text-gray-900 dark:text-white">
+          Delete Contacts From JSON
+        </h3>
+      </div>
+
+      <form action="{{ route('wix.contacts.delete.by.json') }}" method="POST" enctype="multipart/form-data" class="space-y-4">
+        @csrf
+
+        <div>
+          <label for="delete_to_store_{{ $idx }}" class="block mb-2 text-sm font-medium text-gray-900 dark:text-white">
+            Target Store (delete from)
+          </label>
+          <select id="delete_to_store_{{ $idx }}" name="to_store" required
+                  class="bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5
+                         dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-blue-500 dark:focus:border-blue-500">
+            <option value="" selected disabled>Select Store</option>
+            @foreach($stores as $s)
+              <option value="{{ $s->instance_id }}">
+                {{ $s->store_name }} ({{ \Illuminate\Support\Str::limit($s->instance_id, 30, '...') }})
+              </option>
+            @endforeach
+          </select>
+        </div>
+
+        <div>
+          <label for="delete_contacts_json_{{ $idx }}" class="block mb-2 text-sm font-medium text-gray-900 dark:text-white">
+            Contacts JSON File
+          </label>
+          <input type="file"
+                 name="contacts_json"
+                 id="delete_contacts_json_{{ $idx }}"
+                 accept=".json"
+                 class="block w-full cursor-pointer rounded-lg border border-gray-300 bg-gray-50 text-sm text-gray-900
+                        file:mr-2 file:cursor-pointer file:rounded-l-lg file:border-0 file:bg-gray-200
+                        file:px-3 file:py-2 file:text-gray-900 focus:border-blue-500 focus:ring-blue-500
+                        dark:border-gray-600 dark:bg-gray-700 dark:text-white dark:file:bg-gray-600">
+          <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+            Use the exported JSON from “Compare Between Stores”.
+          </p>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <label class="inline-flex items-center gap-2 text-sm text-gray-900 dark:text-gray-200">
+            <input type="checkbox" name="dry_run" value="1"
+                   class="h-4 w-4 rounded border-gray-300 bg-gray-50 text-blue-600 focus:ring-blue-500
+                          dark:bg-gray-700 dark:border-gray-600">
+            Dry run only (no deletes)
+          </label>
+          <label class="inline-flex items-center gap-2 text-sm text-gray-900 dark:text-gray-200">
+            <input type="checkbox" name="confirm" value="1"
+                   class="h-4 w-4 rounded border-gray-300 bg-gray-50 text-blue-600 focus:ring-blue-500
+                          dark:bg-gray-700 dark:border-gray-600" required>
+            I understand this will delete contacts
+          </label>
+        </div>
+
+        <button type="submit"
+                class="inline-flex items-center justify-center rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500/60">
+          Delete Contacts
+        </button>
+      </form>
+    </div>
+  @endif
 </div>
 
 {{-- Footer (checkbox gates Next) --}}
