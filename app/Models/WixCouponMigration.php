@@ -17,6 +17,7 @@ class WixCouponMigration extends Model
         'user_id',
         'from_store_id',
         'to_store_id',
+        'source_coupon_id',
         'source_coupon_code',
         'source_coupon_name',
         'destination_coupon_id',

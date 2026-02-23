@@ -52,9 +52,55 @@ class WixCouponController extends Controller
             $db = (int)($b['dateCreated'] ?? PHP_INT_MAX);
             return $da <=> $db;
         });
-        WixHelper::log('Auto Coupon Migration', "Fetched ".count($allCoupons)." coupon(s) across {$pages} page(s).", 'info');
+        WixHelper::log('Auto Coupon Migration', "Fetched ".count($allCoupons)." coupon(s) from source across {$pages} page(s).", 'info');
 
-        // 2) Stage append-only pending rows (destination known now)
+        // Build normalised source code set (used for orphan detection)
+        $sourceCodes = [];
+        foreach ($allCoupons as $c) {
+            $code = $c['specification']['code'] ?? null;
+            if ($code) $sourceCodes[strtoupper(trim($code))] = true;
+        }
+
+        // 2) Fetch ALL destination coupons and index by code
+        [$destAll] = $this->queryAllCoupons($toToken, 100);
+        $destByCode = [];
+        foreach ($destAll as $dc) {
+            $spec = $dc['specification'] ?? [];
+            $code = $spec['code'] ?? null;
+            $id   = $dc['id'] ?? null;
+            if ($code && $id) {
+                $destByCode[strtoupper(trim($code))] = ['id' => $id, 'name' => $spec['name'] ?? null];
+            }
+        }
+        WixHelper::log('Auto Coupon Migration', "Found ".count($destByCode)." coupon(s) on destination.", 'info');
+
+        // 3) Delete orphans — coupons in destination that no longer exist in source
+        $deleted = 0; $deleteFailed = 0;
+        foreach ($destByCode as $norm => $destEntry) {
+            if (isset($sourceCodes[$norm])) continue; // still in source, keep it
+
+            $destId = $destEntry['id'];
+            $resp = Http::withHeaders([
+                'Authorization' => $toAuth,
+                'Content-Type'  => 'application/json',
+            ])->delete("https://www.wixapis.com/stores/v2/coupons/{$destId}");
+
+            if ($resp->ok() || $resp->status() === 404) {
+                $deleted++;
+                WixHelper::log('Auto Coupon Migration', "Deleted orphan coupon: code={$norm} id={$destId}", 'info');
+                WixCouponMigration::where('user_id', $userId)
+                    ->where('from_store_id', $fromId)
+                    ->where('to_store_id', $toId)
+                    ->where('destination_coupon_id', $destId)
+                    ->update(['status' => 'deleted', 'error_message' => 'Deleted: no longer present in source store.']);
+            } else {
+                $deleteFailed++;
+                WixHelper::log('Auto Coupon Migration', "Delete failed: code={$norm} id={$destId} status=".$resp->status().' body='.$resp->body(), 'warn');
+            }
+        }
+        WixHelper::log('Auto Coupon Migration', "Orphan cleanup: deleted={$deleted}, deleteFailed={$deleteFailed}.", 'info');
+
+        // 4) Stage append-only pending rows
         $staged = 0;
         foreach ($allCoupons as $c) {
             $spec = $c['specification'] ?? [];
@@ -66,6 +112,7 @@ class WixCouponController extends Controller
                     'user_id'               => $userId,
                     'from_store_id'         => $fromId,
                     'to_store_id'           => $toId,
+                    'source_coupon_id'      => $c['id'] ?? null,
                     'source_coupon_code'    => $code,
                     'source_coupon_name'    => $spec['name'] ?? null,
                     'destination_coupon_id' => null,
@@ -79,7 +126,7 @@ class WixCouponController extends Controller
         }
         WixHelper::log('Auto Coupon Migration', "Staged {$staged} pending row(s).", 'success');
 
-        // ---- Row claim/resolve for results
+        // ---- Row claim/resolve helpers (code-based)
         $claimPendingRow = function (?string $code) use ($userId, $fromId) {
             return DB::transaction(function () use ($userId, $fromId, $code) {
                 $row = null;
@@ -115,7 +162,6 @@ class WixCouponController extends Controller
                     ->where('source_coupon_code', $code)
                     ->orderBy('created_at', 'asc')
                     ->first();
-
                 if ($existing) {
                     if ($claimed && $claimed->id !== $existing->id && $claimed->status === 'pending') {
                         $claimed->update([
@@ -129,10 +175,12 @@ class WixCouponController extends Controller
             return $claimed;
         };
 
-        // 3) Build clean specs with strict mapping; fail-fast on unmapped
-        $specs   = [];
-        $imported= 0;
-        $failed  = 0;
+        // 5) Map scope entity IDs (strict) and split into link vs create
+        $toLink   = []; // already on destination — just update DB record, no API call
+        $toCreate = []; // not on destination — need to create
+        $imported = 0;
+        $linked   = 0;
+        $failed   = 0;
 
         foreach ($allCoupons as $c) {
             $s = $c['specification'] ?? null;
@@ -143,18 +191,14 @@ class WixCouponController extends Controller
                 unset($s['scope']['group']['entityId']);
             }
 
-            // STRICT mapping, same pattern as Discount Rules
             $mapped = $this->mapScopeEntityIds($s, $fromId, $toId, true, $c ?? null);
             $meta   = $mapped['__mapMeta'] ?? ['mapped' => true, 'reason' => 'n/a'];
             unset($mapped['__mapMeta']);
 
-            if ($meta['mapped'] === true) {
-                $specs[] = $mapped;
-            } else {
+            if ($meta['mapped'] !== true) {
                 $code      = $s['code'] ?? null;
                 $claimed   = $claimPendingRow($code);
                 $targetRow = $resolveTargetRow($claimed, $code);
-
                 if ($targetRow) {
                     $msg = "Entity mapping failed ({$meta['reason']})"
                         . (!empty($meta['wanted']) ? " for source entityId={$meta['wanted']}" : '');
@@ -168,47 +212,43 @@ class WixCouponController extends Controller
                     WixHelper::log('Auto Coupon Migration', $msg." | code=".($code ?? 'n/a'), 'warn');
                 }
                 $failed++;
+                continue;
+            }
+
+            $norm = strtoupper(trim($mapped['code'] ?? ''));
+            if (isset($destByCode[$norm]) && $destByCode[$norm]['id']) {
+                $toLink[] = ['destId' => $destByCode[$norm]['id'], 'spec' => $mapped];
+            } else {
+                $toCreate[] = $mapped;
             }
         }
 
-        // 3.5) De-dup against destination by coupon code (case-insensitive)
-        $destByCode = $this->indexDestinationCouponsByCode($toToken);
+        // 6) Link existing destination coupons (DB only, no API call)
+        foreach ($toLink as $item) {
+            $destId = $item['destId'];
+            $spec   = $item['spec'];
+            $code   = $spec['code'] ?? null;
 
-        $filtered = [];
-        foreach ($specs as $s) {
-            $code = $s['code'] ?? null;
-            if (!$code) continue;
+            $claimed   = $claimPendingRow($code);
+            $targetRow = $resolveTargetRow($claimed, $code);
 
-            $norm = strtoupper(trim($code));
-            if (isset($destByCode[$norm])) {
-                // Already exists on destination → link & mark success
-                $claimed   = $claimPendingRow($code);
-                $targetRow = $resolveTargetRow($claimed, $code);
-                if ($targetRow) {
-                    DB::transaction(function () use ($targetRow, $toId, $s, $code, $destByCode, $norm) {
-                        $targetRow->update([
-                            'to_store_id'           => $toId,
-                            'destination_coupon_id' => $destByCode[$norm]['id'],
-                            'status'                => 'success',
-                            'error_message'         => 'Already existed on destination; linked.',
-                            'source_coupon_name'    => $s['name'] ?? $targetRow->source_coupon_name,
-                            'source_coupon_code'    => $targetRow->source_coupon_code ?: $code,
-                        ]);
-                    }, 3);
-                }
-                continue; // skip create
+            if ($targetRow) {
+                DB::transaction(function () use ($targetRow, $toId, $destId, $spec, $code) {
+                    $targetRow->update([
+                        'to_store_id'           => $toId,
+                        'destination_coupon_id' => $destId,
+                        'status'                => 'success',
+                        'error_message'         => 'Already existed on destination; linked.',
+                        'source_coupon_name'    => $spec['name'] ?? $targetRow->source_coupon_name,
+                        'source_coupon_code'    => $targetRow->source_coupon_code ?: $code,
+                    ]);
+                }, 3);
+                $linked++;
             }
-            $filtered[] = $s;
-        }
-        $specs = $filtered;
-
-        if (empty($specs)) {
-            WixHelper::log('Auto Coupon Migration', 'All coupons already existed on destination. Nothing to create.', 'info');
-            return back()->with('success', 'Nothing to create — all coupons already exist. Linked records in migration table.');
         }
 
-        // 4) Bulk create on destination
-        foreach (array_chunk($specs, 100) as $chunk) {
+        // 7) Bulk create new coupons
+        foreach (array_chunk($toCreate, 100) as $chunk) {
             $resp = Http::withHeaders([
                 'Authorization' => $toAuth,
                 'Content-Type'  => 'application/json',
@@ -225,7 +265,6 @@ class WixCouponController extends Controller
                     $code      = $s['code'] ?? null;
                     $claimed   = $claimPendingRow($code);
                     $targetRow = $resolveTargetRow($claimed, $code);
-
                     if ($targetRow) {
                         $targetRow->update([
                             'to_store_id'        => $toId,
@@ -286,21 +325,21 @@ class WixCouponController extends Controller
             }
         }
 
-        // ===== Summary & flash (surface partial failures) =====
-        $summary = "Coupons: imported={$imported}, failed={$failed}";
+        // ===== Summary =====
+        $summary = "Coupons: created={$imported}, linked={$linked}, deleted={$deleted}, failed={$failed}"
+            . ($deleteFailed ? ", deleteFailed={$deleteFailed}" : '');
 
-        if ($imported > 0) {
-            WixHelper::log('Auto Coupon Migration', "Done. {$summary}", $failed ? 'warn' : 'success');
+        WixHelper::log('Auto Coupon Migration', "Done. {$summary}", $failed ? 'warn' : 'success');
+
+        if ($imported > 0 || $linked > 0 || $deleted > 0) {
             return back()->with($failed ? 'warning' : 'success', "Auto coupon migration completed. {$summary}");
         }
 
         if ($failed > 0) {
-            WixHelper::log('Auto Coupon Migration', "Done. {$summary}", 'error');
-            return back()->with('error', "No coupons imported. {$summary}");
+            return back()->with('error', "No coupons synced. {$summary}");
         }
 
-        WixHelper::log('Auto Coupon Migration', 'Done. Nothing to import.', 'info');
-        return back()->with('success', 'Nothing to import.');
+        return back()->with('success', 'Coupons already in sync. Nothing to do.');
     }
 
     // ========================================================= Manual Migrator =========================================================
@@ -340,6 +379,7 @@ class WixCouponController extends Controller
                 'user_id'                => $userId,
                 'from_store_id'          => $fromStoreId,
                 'to_store_id'            => null,
+                'source_coupon_id'       => $c['id'] ?? null,
                 'source_coupon_code'     => $code,
                 'source_coupon_name'     => $spec['name'] ?? null,
                 'destination_coupon_id'  => null,
@@ -412,11 +452,21 @@ class WixCouponController extends Controller
         });
 
         // ---- Row claiming & dedupe helpers
-        $claimPendingRow = function (?string $code) use ($userId, $explicitFromStoreId) {
-            return DB::transaction(function () use ($userId, $explicitFromStoreId, $code) {
+        $claimPendingRow = function (?string $code, ?string $sourceId = null) use ($userId, $explicitFromStoreId) {
+            return DB::transaction(function () use ($userId, $explicitFromStoreId, $code, $sourceId) {
                 $row = null;
-
-                if ($code) {
+                // Prefer match by source_coupon_id
+                if ($sourceId) {
+                    $row = WixCouponMigration::where('user_id', $userId)
+                        ->where('from_store_id', $explicitFromStoreId)
+                        ->where('status', 'pending')
+                        ->where('source_coupon_id', $sourceId)
+                        ->orderBy('created_at', 'asc')
+                        ->lockForUpdate()
+                        ->first();
+                }
+                // Fallback: match by code
+                if (!$row && $code) {
                     $row = WixCouponMigration::where('user_id', $userId)
                         ->where('from_store_id', $explicitFromStoreId)
                         ->where('status', 'pending')
@@ -429,7 +479,6 @@ class WixCouponController extends Controller
                         ->lockForUpdate()
                         ->first();
                 }
-
                 if (!$row) {
                     $row = WixCouponMigration::where('user_id', $userId)
                         ->where('from_store_id', $explicitFromStoreId)
@@ -438,12 +487,31 @@ class WixCouponController extends Controller
                         ->lockForUpdate()
                         ->first();
                 }
-
                 return $row;
             }, 3);
         };
 
-        $resolveTargetRow = function (?WixCouponMigration $claimed, ?string $code) use ($userId, $explicitFromStoreId, $toStoreId) {
+        $resolveTargetRow = function (?WixCouponMigration $claimed, ?string $code, ?string $sourceId = null) use ($userId, $explicitFromStoreId, $toStoreId) {
+            $merge = function ($claimed, $existing) {
+                if ($claimed && $claimed->id !== $existing->id && $claimed->status === 'pending') {
+                    $claimed->update([
+                        'status'        => 'skipped',
+                        'error_message' => 'Merged into existing migration row id '.$existing->id,
+                    ]);
+                }
+                return $existing;
+            };
+            // Prefer lookup by source_coupon_id
+            if ($sourceId) {
+                $existing = WixCouponMigration::where('user_id', $userId)
+                    ->where('from_store_id', $explicitFromStoreId)
+                    ->where('to_store_id', $toStoreId)
+                    ->where('source_coupon_id', $sourceId)
+                    ->orderBy('created_at', 'asc')
+                    ->first();
+                if ($existing) return $merge($claimed, $existing);
+            }
+            // Fallback: lookup by code
             if ($code) {
                 $existing = WixCouponMigration::where('user_id', $userId)
                     ->where('from_store_id', $explicitFromStoreId)
@@ -451,27 +519,20 @@ class WixCouponController extends Controller
                     ->where('source_coupon_code', $code)
                     ->orderBy('created_at', 'asc')
                     ->first();
-
-                if ($existing) {
-                    if ($claimed && $claimed->id !== $existing->id && $claimed->status === 'pending') {
-                        $claimed->update([
-                            'status'        => 'skipped',
-                            'error_message' => 'Merged into existing migration row id '.$existing->id,
-                        ]);
-                    }
-                    return $existing;
-                }
+                if ($existing) return $merge($claimed, $existing);
             }
             return $claimed;
         };
 
-        // Build mapped specs (strict)
+        // Build mapped specs (strict); carry source_coupon_id alongside each spec
+        // $specs entries: ['spec' => [...], 'sourceId' => '...']
         $specs   = [];
         $failed  = 0;
         $imported= 0;
 
         foreach ($coupons as $c) {
-            $s = $c['specification'] ?? null;
+            $s        = $c['specification'] ?? null;
+            $sourceId = $c['id'] ?? null;
             if (!is_array($s)) continue;
 
             if (empty($s['name']) || empty($s['code']) || empty($s['startTime'])) continue;
@@ -486,18 +547,19 @@ class WixCouponController extends Controller
             unset($mapped['__mapMeta']);
 
             if ($meta['mapped'] === true) {
-                $specs[] = $mapped;
+                $specs[] = ['spec' => $mapped, 'sourceId' => $sourceId];
             } else {
                 // fail-fast this coupon; do not send to Wix
                 $code      = $s['code'] ?? null;
-                $claimed   = $claimPendingRow($code);
-                $targetRow = $resolveTargetRow($claimed, $code);
+                $claimed   = $claimPendingRow($code, $sourceId);
+                $targetRow = $resolveTargetRow($claimed, $code, $sourceId);
 
                 if ($targetRow) {
                     $msg = "Entity mapping failed ({$meta['reason']})"
                          . (!empty($meta['wanted']) ? " for source entityId={$meta['wanted']}" : '');
                     $targetRow->update([
                         'to_store_id'           => $toStoreId,
+                        'source_coupon_id'      => $sourceId ?? $targetRow->source_coupon_id,
                         'status'                => 'failed',
                         'error_message'         => $msg,
                         'source_coupon_name'    => $s['name'] ?? $targetRow->source_coupon_name,
@@ -513,18 +575,21 @@ class WixCouponController extends Controller
         $destByCode = $this->indexDestinationCouponsByCode($accessToken);
 
         $filtered = [];
-        foreach ($specs as $s) {
-            $code = $s['code'] ?? null;
+        foreach ($specs as $entry) {
+            $s        = $entry['spec'];
+            $sourceId = $entry['sourceId'] ?? null;
+            $code     = $s['code'] ?? null;
             if (!$code) continue;
 
             $norm = strtoupper(trim($code));
             if (isset($destByCode[$norm])) {
-                $claimed   = $claimPendingRow($code);
-                $targetRow = $resolveTargetRow($claimed, $code);
+                $claimed   = $claimPendingRow($code, $sourceId);
+                $targetRow = $resolveTargetRow($claimed, $code, $sourceId);
                 if ($targetRow) {
-                    DB::transaction(function () use ($targetRow, $toStoreId, $s, $code, $destByCode, $norm) {
+                    DB::transaction(function () use ($targetRow, $toStoreId, $s, $code, $sourceId, $destByCode, $norm) {
                         $targetRow->update([
                             'to_store_id'           => $toStoreId,
+                            'source_coupon_id'      => $sourceId ?? $targetRow->source_coupon_id,
                             'destination_coupon_id' => $destByCode[$norm]['id'],
                             'status'                => 'success',
                             'error_message'         => 'Already existed on destination; linked.',
@@ -535,7 +600,7 @@ class WixCouponController extends Controller
                 }
                 continue; // skip create
             }
-            $filtered[] = $s;
+            $filtered[] = $entry;
         }
         $specs = $filtered;
 
@@ -544,13 +609,15 @@ class WixCouponController extends Controller
             return back()->with('success', 'Nothing to create — all coupons already exist. Linked records in migration table.');
         }
 
-        // Send in chunks
+        // Send in chunks; extract raw specs for the API payload
         foreach (array_chunk($specs, 100) as $chunk) {
+            $apiSpecs = array_column($chunk, 'spec');
+
             $resp = Http::withHeaders([
                 'Authorization' => $authHeader,
                 'Content-Type'  => 'application/json',
             ])->post('https://www.wixapis.com/stores/v2/bulk/coupons/create', [
-                'specifications'   => $chunk,
+                'specifications'   => $apiSpecs,
                 'returnFullEntity' => true,
             ]);
 
@@ -558,13 +625,16 @@ class WixCouponController extends Controller
 
             if ($resp->failed()) {
                 WixHelper::log('Import Coupons', "Bulk create HTTP ".$resp->status().' | '.$raw, 'error');
-                foreach ($chunk as $s) {
-                    $code      = $s['code'] ?? null;
-                    $claimed   = $claimPendingRow($code);
-                    $targetRow = $resolveTargetRow($claimed, $code);
+                foreach ($chunk as $entry) {
+                    $s        = $entry['spec'];
+                    $sourceId = $entry['sourceId'] ?? null;
+                    $code     = $s['code'] ?? null;
+                    $claimed   = $claimPendingRow($code, $sourceId);
+                    $targetRow = $resolveTargetRow($claimed, $code, $sourceId);
                     if ($targetRow) {
                         $targetRow->update([
                             'to_store_id'           => $toStoreId,
+                            'source_coupon_id'      => $sourceId ?? $targetRow->source_coupon_id,
                             'status'                => 'failed',
                             'error_message'         => $raw,
                             'source_coupon_name'    => $s['name'] ?? $targetRow->source_coupon_name,
@@ -580,19 +650,22 @@ class WixCouponController extends Controller
             $results = $res['results'] ?? $res['items'] ?? [];
 
             foreach ($results as $i => $item) {
-                $s        = $chunk[$i] ?? [];
+                $entry    = $chunk[$i] ?? [];
+                $s        = $entry['spec'] ?? [];
+                $sourceId = $entry['sourceId'] ?? null;
                 $code     = $s['code'] ?? null;
                 $success  = $item['success'] ?? ($item['itemMetadata']['success'] ?? null);
                 $couponId = $item['item']['id'] ?? ($item['coupon']['id'] ?? $item['id'] ?? null);
 
-                $claimed   = $claimPendingRow($code);
-                $targetRow = $resolveTargetRow($claimed, $code);
+                $claimed   = $claimPendingRow($code, $sourceId);
+                $targetRow = $resolveTargetRow($claimed, $code, $sourceId);
 
                 if ($success === true && $couponId) {
                     if ($targetRow) {
-                        DB::transaction(function () use ($targetRow, $toStoreId, $couponId, $s, $code) {
+                        DB::transaction(function () use ($targetRow, $toStoreId, $couponId, $s, $code, $sourceId) {
                             $targetRow->update([
                                 'to_store_id'           => $toStoreId,
+                                'source_coupon_id'      => $sourceId ?? $targetRow->source_coupon_id,
                                 'destination_coupon_id' => $couponId,
                                 'status'                => 'success',
                                 'error_message'         => null,
@@ -607,9 +680,10 @@ class WixCouponController extends Controller
                     WixHelper::log('Import Coupons', "Create failed for code={$code} | {$err}", 'warn');
 
                     if ($targetRow) {
-                        DB::transaction(function () use ($targetRow, $toStoreId, $s, $code, $err) {
+                        DB::transaction(function () use ($targetRow, $toStoreId, $s, $code, $sourceId, $err) {
                             $targetRow->update([
                                 'to_store_id'           => $toStoreId,
+                                'source_coupon_id'      => $sourceId ?? $targetRow->source_coupon_id,
                                 'destination_coupon_id' => null,
                                 'status'                => 'failed',
                                 'error_message'         => $err,

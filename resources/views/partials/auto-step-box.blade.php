@@ -9,8 +9,8 @@
     'Gift Cards'         => ['key' => 'gift_cards_auto',      'migrate' => 'wix.migrate.gift.cards',      'label' => 'Gift Cards'],
     'Loyalty'            => ['key' => 'loyalty_auto',         'migrate' => 'wix.migrate.loyalty',         'label' => 'Loyalty'],
     'Media'              => ['key' => 'media_auto',           'migrate' => 'wix.migrate.media',           'label' => 'Media'],
-    'Contacts & Members' => ['key' => 'contacts_members_auto','migrate' => 'wix.migrate.contacts.members','label' => 'Contacts & Members'], 
-    'Back in Stock'      => ['key' => 'back_in_stock_auto',   'migrate' => 'wix.migrate.back.in.stock',   'label' => 'Back in Stock'], 
+    'Contacts & Members' => ['key' => 'contacts_members_auto','migrate' => 'wix.migrate.contacts.members','label' => 'Contacts & Members'],
+    'Back in Stock'      => ['key' => 'back_in_stock_auto',   'migrate' => 'wix.migrate.back.in.stock',   'label' => 'Back in Stock'],
   ];
 
   // Resolve current step config (and guard if missing)
@@ -383,7 +383,7 @@
           </button>
           @endif
         </div>
-        
+
         <p class="text-xs text-gray-500 dark:text-gray-400">
           <b class="text-blue-600">{{ $cfg['label'] }}</b> - Data will be automatically migrated from "FROM STORE" to "TO STORE"
         </p>
@@ -395,6 +395,120 @@
     </div>
   @endif
 </div>
+
+@php
+  $autoNotes = [
+    'Categories' => [
+      'title' => 'Categories - Automatic Migration Capabilities',
+      'points' => [
+        'Fetches all categories from the source store (supports both Wix V1 and V3 API, detected automatically).',
+        'Matches existing categories in the target by slug or name - updates them if found.',
+        'Creates any categories that are missing from the target store.',
+        'Preserves: name, slug, description, cover image, visibility, and SEO data.',
+        'The system "All Products" category is updated only - never deleted or recreated.',
+        'Generates unique slugs automatically when a conflict is detected in the target.',
+        '<strong>Sync SEO Data</strong> button: re-syncs only SEO meta tags for categories that were already migrated.',
+      ],
+    ],
+    'Products' => [
+      'title' => 'Products - Automatic Migration Capabilities',
+      'points' => [
+        'Fetches all products from the source store, or only the ones you select from the dropdown.',
+        'Matches existing products in the target by slug - updates them if found, creates new ones if missing.',
+        'Migrates product fields: name, slug, description, type (physical / digital), SKU, price, weight, and stock.',
+        'Migrates product variants with individual inventory quantities and in-stock status.',
+        'Preserves product media (images), options, ribbons, brands, info sections, and custom text fields.',
+        'Links each product to its categories in the target store using collection slugs.',
+        '<strong>Sync SEO Data</strong> button: re-syncs only SEO metadata for products that were already migrated.',
+      ],
+    ],
+    'Contacts & Members' => [
+      'title' => 'Contacts & Members - Automatic Migration Capabilities',
+      'points' => [
+        'Fetches contacts page-by-page from the source store (configurable page size, up to 1,000 per page).',
+        '<strong>Start Migration</strong>: migrates all contacts from source to target.',
+        '<strong>Migrate Missing Only</strong>: skips contacts that already exist in the target (matched by email).',
+        'Supports resume offset - run in batches and continue from where you left off.',
+        'Preserves: name, email, phone, labels, addresses, and custom fields.',
+      ],
+    ],
+    'Orders' => [
+      'title' => 'Orders - Automatic Migration Capabilities',
+      'points' => [
+        'Fetches orders from the source store with optional hard cap (max orders per run).',
+        'Supports date range filtering - migrate orders created within a specific date window.',
+        'Matches existing orders in the target; creates new ones for any that are missing.',
+        'Preserves order details: line items, buyer info, payment status, shipping, and totals.',
+      ],
+    ],
+    'Discounts' => [
+      'title' => 'Discounts - Automatic Migration Capabilities',
+      'points' => [
+        'Fetches all discount rules from the source store.',
+        'Creates missing discount rules in the target; updates existing ones.',
+        'Preserves: name, scope, discount type, amount/percentage, and active status.',
+      ],
+    ],
+    'Coupons' => [
+      'title' => 'Coupons - Automatic Migration Capabilities',
+      'points' => [
+        'Fetches all coupons from the source store.',
+        'Creates missing coupons in the target; updates existing ones matched by code.',
+        'Preserves: coupon code, discount type, value, usage limits, and expiry date.',
+      ],
+    ],
+    'Gift Cards' => [
+      'title' => 'Gift Cards - Automatic Migration Capabilities',
+      'points' => [
+        'Fetches gift cards from the source with optional hard cap and date range filter.',
+        'Creates missing gift cards in the target store; skips cards already migrated (deduplicated by source ID).',
+        'Preserves: initial value, currency, expiry date, and disabled status.',
+        '<strong>Note:</strong> Wix does not allow setting the current balance via API — each migrated card starts at its original face value (initialValue), not the remaining balance.',
+      ],
+    ],
+    'Loyalty' => [
+      'title' => 'Loyalty - Automatic Migration Capabilities',
+      'points' => [
+        'Fetches loyalty accounts from the source store.',
+        'Creates or updates loyalty accounts in the target store.',
+        'Preserves: points balance, tier, and account status.',
+      ],
+    ],
+    'Media' => [
+      'title' => 'Media - Automatic Migration Capabilities',
+      'points' => [
+        'Fetches media items from the source store.',
+        'Uploads missing media files to the target store.',
+        'Preserves: file name, alt text, and folder structure.',
+      ],
+    ],
+    'Back in Stock' => [
+      'title' => 'Back in Stock - Automatic Migration Capabilities',
+      'points' => [
+        'Fetches back-in-stock notification subscriptions from the source store.',
+        'Creates missing subscriptions in the target store.',
+        'Preserves: product reference, variant, and subscriber email.',
+      ],
+    ],
+  ];
+  $autoNote = $autoNotes[$title] ?? null;
+@endphp
+
+@if($autoNote)
+<div class="mt-4 rounded-lg border border-blue-300 dark:border-blue-700 bg-blue-50 dark:bg-blue-900/20 p-4">
+  <div class="flex items-start gap-2 mb-2">
+    <svg class="w-4 h-4 mt-0.5 shrink-0 text-blue-600 dark:text-blue-400" fill="currentColor" viewBox="0 0 20 20">
+      <path fill-rule="evenodd" d="M18 10A8 8 0 1 1 2 10a8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.253a.25.25 0 0 1 .244.304l-.459 2.066A1.75 1.75 0 0 0 10.747 15H11a.75.75 0 0 0 0-1.5h-.253a.25.25 0 0 1-.244-.304l.459-2.066A1.75 1.75 0 0 0 9.253 9H9Z" clip-rule="evenodd"/>
+    </svg>
+    <p class="text-sm font-semibold text-blue-800 dark:text-blue-300">{{ $autoNote['title'] }}</p>
+  </div>
+  <ul class="ml-6 space-y-1 list-disc text-sm text-blue-700 dark:text-blue-300">
+    @foreach($autoNote['points'] as $point)
+      <li>{!! $point !!}</li>
+    @endforeach
+  </ul>
+</div>
+@endif
 
 {{-- Footer (confirmation checkbox gates Next/Finish) --}}
 <div class="mt-4 sm:mt-6" x-data="{ confirmed: false }">

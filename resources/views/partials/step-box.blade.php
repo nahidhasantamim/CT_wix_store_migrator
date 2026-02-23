@@ -9,8 +9,8 @@
     'Gift Cards' => ['key' => 'gift_cards', 'export' => 'wix.export.gift.cards', 'import' => 'wix.import.gift.cards', 'label' => 'Gift Cards'],
     'Loyalty' => ['key' => 'loyalty', 'export' => 'wix.loyalty.export', 'import' => 'wix.loyalty.import', 'label' => 'Loyalty'],
     'Media' => ['key' => 'media', 'export' => 'wix.export.media', 'import' => 'wix.import.media', 'label' => 'Media'],
-    'Contacts & Members' => ['key' => 'contacts', 'export' => 'wix.export.contacts', 'import' => 'wix.import.contacts', 'label' => 'Contacts & Members'], 
-    'Back in Stock' => ['key' => 'back_in_stock', 'export' => 'wix.export.back.in.stock', 'import' => 'wix.import.back.in.stock', 'label' => 'Back in Stock'], 
+    'Contacts & Members' => ['key' => 'contacts', 'export' => 'wix.export.contacts', 'import' => 'wix.import.contacts', 'label' => 'Contacts & Members'],
+    'Back in Stock' => ['key' => 'back_in_stock', 'export' => 'wix.export.back.in.stock', 'import' => 'wix.import.back.in.stock', 'label' => 'Back in Stock'],
   ];
   // $isContactsMembers = ($title === 'Contacts & Members');
 @endphp
@@ -210,7 +210,7 @@
                     </div>
 
                     <p class="text-[11px] text-gray-400">
-                      Dates are interpreted in <span class="font-medium text-gray-200">America/Los_Angeles</span> (inclusive start/end of day).  
+                      Dates are interpreted in <span class="font-medium text-gray-200">America/Los_Angeles</span> (inclusive start/end of day).
                       Accepts <code>YYYY-MM-DD</code> or <code>DD.MM.YYYY</code>.
                     </p>
 
@@ -219,7 +219,7 @@
                       Download
                     </button>
                   </form>
-                
+
                 @elseif (($conf['key'] ?? null) === 'gift_cards')
                   {{-- Gift Cards export: optional date range + limit --}}
                   <form action="{{ route($conf['export'], $store) }}" method="GET" class="space-y-3" x-data="{ useRange: false }">
@@ -286,7 +286,7 @@
                            required>
                     <button type="submit"
                             class="mt-2 inline-flex w-full items-center justify-center rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500/60 sm:absolute sm:top-0 sm:right-0 sm:mt-0 sm:h-full sm:w-auto sm:rounded-l-none">
-                      Upload 
+                      Upload
                     </button>
                   </div>
                 </form>
@@ -341,7 +341,7 @@
               @if (($conf['key'] ?? null) === 'contacts')
                 <!-- NEW SYNC BUTTONS -->
                 <div class="grid">
-                  
+
 
                   <!-- Destination Store Sync -->
                   <form action="{{ route('wix.contacts.syncDestination', $store) }}" method="POST">
@@ -591,6 +591,116 @@
     </div>
   @endif
 </div>
+
+@php
+  $manualNotes = [
+    'Categories' => [
+      'title' => 'Categories - Manual Migration Capabilities',
+      'points' => [
+        '<strong>Export:</strong> Downloads a JSON file of all categories from the selected store (supports both Wix V1 and V3 APIs).',
+        '<strong>Import:</strong> Uploads the JSON to the target store - updates existing categories matched by slug or name, creates missing ones.',
+        'Preserves: name, slug, description, cover image, and visibility.',
+        'The system "All Products" category is updated only - never deleted or recreated.',
+        'Duplicate slugs are handled automatically by generating unique variants.',
+      ],
+    ],
+    'Products' => [
+      'title' => 'Products - Manual Migration Capabilities',
+      'points' => [
+        '<strong>Export:</strong> Downloads a JSON file of all products with full variant and inventory data from the selected store.',
+        '<strong>Import:</strong> Uploads the JSON to the target store - updates existing products, creates missing ones.',
+        'Migrates product fields: name, slug, description, type (physical / digital), SKU, price, weight, and stock.',
+        'Includes product variants with individual inventory quantities and in-stock status.',
+        'Preserves product media (images), options, ribbons, brands, info sections, and custom text fields.',
+      ],
+    ],
+    'Contacts & Members' => [
+      'title' => 'Contacts & Members - Manual Migration Capabilities',
+      'points' => [
+        '<strong>Export:</strong> Downloads a JSON file of contacts (with optional date filter and max cap).',
+        '<strong>Import:</strong> Uploads the JSON to create or update contacts in the target store.',
+        'Preserves: name, email, phone, labels, addresses, and custom fields.',
+        '<strong>Compare & Export Missing:</strong> Finds contacts present in the source but missing in the target, then exports them.',
+        '<strong>Delete Contacts from JSON:</strong> Removes a list of contacts from a target store using an exported JSON file.',
+      ],
+    ],
+    'Orders' => [
+      'title' => 'Orders - Manual Migration Capabilities',
+      'points' => [
+        '<strong>Export:</strong> Downloads a JSON file of orders with optional date range filter and order cap.',
+        '<strong>Import:</strong> Uploads the JSON to re-create orders in the target store.',
+        'Preserves order details: line items, buyer info, payment status, shipping, and totals.',
+      ],
+    ],
+    'Discounts' => [
+      'title' => 'Discounts - Manual Migration Capabilities',
+      'points' => [
+        '<strong>Export:</strong> Downloads a JSON file of all discount rules from the selected store.',
+        '<strong>Import:</strong> Uploads the JSON to create or update discount rules in the target store.',
+        'Preserves: name, scope, discount type, amount / percentage, and active status.',
+      ],
+    ],
+    'Coupons' => [
+      'title' => 'Coupons - Manual Migration Capabilities',
+      'points' => [
+        '<strong>Export:</strong> Downloads a JSON file of all coupons from the selected store.',
+        '<strong>Import:</strong> Uploads the JSON to create or update coupons in the target store, matched by code.',
+        'Preserves: coupon code, discount type, value, usage limits, and expiry date.',
+      ],
+    ],
+    'Gift Cards' => [
+      'title' => 'Gift Cards - Manual Migration Capabilities',
+      'points' => [
+        '<strong>Export:</strong> Downloads a JSON file of gift cards with optional date filter and cap.',
+        '<strong>Import:</strong> Uploads the JSON to create gift cards in the target store.',
+        'Option to send an email notification to the recipient on import.',
+        'Preserves: initial value, currency, and expiry date.',
+        '<strong>Note:</strong> Wix does not allow setting the current balance via API — each migrated card starts at its original face value (initialValue), not the remaining balance.',
+      ],
+    ],
+    'Loyalty' => [
+      'title' => 'Loyalty - Manual Migration Capabilities',
+      'points' => [
+        '<strong>Export:</strong> Downloads a JSON file of loyalty accounts from the selected store.',
+        '<strong>Import:</strong> Uploads the JSON to create or update loyalty accounts in the target store.',
+        'Preserves: points balance, tier, and account status.',
+      ],
+    ],
+    'Media' => [
+      'title' => 'Media - Manual Migration Capabilities',
+      'points' => [
+        '<strong>Export:</strong> Downloads a JSON file listing all media items from the selected store.',
+        '<strong>Import:</strong> Uploads media files to the target store.',
+        'Preserves: file name, alt text, and folder structure.',
+      ],
+    ],
+    'Back in Stock' => [
+      'title' => 'Back in Stock - Manual Migration Capabilities',
+      'points' => [
+        '<strong>Export:</strong> Downloads a JSON file of back-in-stock notification subscriptions.',
+        '<strong>Import:</strong> Uploads the JSON to re-create subscriptions in the target store.',
+        'Preserves: product reference, variant, and subscriber email.',
+      ],
+    ],
+  ];
+  $manualNote = $manualNotes[$title] ?? null;
+@endphp
+
+@if($manualNote)
+<div class="mt-4 rounded-lg border border-blue-300 dark:border-blue-700 bg-blue-50 dark:bg-blue-900/20 p-4">
+  <div class="flex items-start gap-2 mb-2">
+    <svg class="w-4 h-4 mt-0.5 shrink-0 text-blue-600 dark:text-blue-400" fill="currentColor" viewBox="0 0 20 20">
+      <path fill-rule="evenodd" d="M18 10A8 8 0 1 1 2 10a8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.253a.25.25 0 0 1 .244.304l-.459 2.066A1.75 1.75 0 0 0 10.747 15H11a.75.75 0 0 0 0-1.5h-.253a.25.25 0 0 1-.244-.304l.459-2.066A1.75 1.75 0 0 0 9.253 9H9Z" clip-rule="evenodd"/>
+    </svg>
+    <p class="text-sm font-semibold text-blue-800 dark:text-blue-300">{{ $manualNote['title'] }}</p>
+  </div>
+  <ul class="ml-6 space-y-1 list-disc text-sm text-blue-700 dark:text-blue-300">
+    @foreach($manualNote['points'] as $point)
+      <li>{!! $point !!}</li>
+    @endforeach
+  </ul>
+</div>
+@endif
 
 {{-- Footer (checkbox gates Next) --}}
 <div class="mt-4 sm:mt-6" x-data="{ confirmed: false }" x-cloak>
