@@ -157,5 +157,6 @@ Route::middleware('auth')->group(function () {
     Route::post('/wix/back-in-stock/auto-migrate', [WixBackInStockController::class, 'migrateAuto'])->name('wix.migrate.back.in.stock');
     Route::get('/wix/{store}/back-in-stock-export', [WixBackInStockController::class, 'export'])->name('wix.export.back.in.stock');
     Route::post('/wix/{store}/back-in-stock-import', [WixBackInStockController::class, 'import'])->name('wix.import.back.in.stock');
+    Route::post('/wix/{store}/back-in-stock-delete', [WixBackInStockController::class, 'deleteFromJson'])->name('wix.delete.back.in.stock');
 
 });

@@ -263,6 +263,39 @@
                     </button>
                   </form>
 
+                @elseif (($conf['key'] ?? null) === 'back_in_stock')
+                  {{-- Back in Stock export: sort direction + optional limit --}}
+                  <form action="{{ route($conf['export'], $store) }}" method="GET" class="space-y-3">
+
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <div>
+                        <label class="block text-xs text-gray-300 mb-1">Select By Created Date</label>
+                        <select name="sort_order"
+                                class="w-full rounded-md border border-gray-600 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:ring-blue-500">
+                          <option value="DESC">Latest first</option>
+                          <option value="ASC">Oldest first</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label class="block text-xs text-gray-300 mb-1">Max Rows (optional)</label>
+                        <input type="number" min="1" name="limit"
+                              class="w-full rounded-md border border-gray-600 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:border-blue-500 focus:ring-blue-500"
+                              placeholder="e.g. 100">
+                      </div>
+                    </div>
+
+                    <p class="text-xs text-gray-400">
+                      Output file is always sorted oldest &rarr; latest so the import replays chronologically.
+                      <b>Latest first</b> + limit = most recent N requests; <b>Oldest first</b> + limit = earliest N.
+                    </p>
+
+                    <button type="submit"
+                            class="inline-flex w-full items-center justify-center rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 focus:ring-2 focus:ring-blue-500/60">
+                      Download
+                    </button>
+                  </form>
+
                 @else
                   {{-- Default export for all other entities --}}
                   <a href="{{ route($conf['export'], $store) }}"
@@ -337,6 +370,40 @@
                 </form>
               </div>
 
+              {{-- Back in Stock: Delete by uploaded JSON --}}
+              @if (($conf['key'] ?? null) === 'back_in_stock')
+                <div class="rounded-lg border border-red-700 bg-red-900/20 p-3 sm:p-4 mt-2">
+                  <h3 class="text-sm font-semibold text-white mb-2 text-center">Delete Back in Stock (from JSON)</h3>
+
+                  <form action="{{ route('wix.delete.back.in.stock', $store) }}" method="POST"
+                        enctype="multipart/form-data" class="w-full"
+                        onsubmit="return confirm('This will PERMANENTLY delete every Back-in-Stock request in the uploaded JSON from this store. Continue?');">
+                    @csrf
+
+                    <div class="relative">
+                      <input type="file"
+                            name="back_in_stock_json"
+                            id="back_in_stock_delete_json_{{ $idx }}_{{ $store->id }}"
+                            accept=".json"
+                            class="block w-full cursor-pointer rounded-lg border border-gray-600 bg-gray-900 text-sm text-gray-200
+                                    file:mr-2 file:cursor-pointer file:rounded-l-lg file:border-0 file:bg-gray-700
+                                    file:px-3 file:py-2 file:text-gray-100 focus:border-red-500 focus:ring-red-500"
+                            required>
+
+                      <button type="submit"
+                              class="mt-2 inline-flex w-full items-center justify-center rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white
+                                    hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500/60 sm:absolute sm:top-0 sm:right-0
+                                    sm:mt-0 sm:h-full sm:w-auto sm:rounded-l-none">
+                        Delete
+                      </button>
+                    </div>
+
+                    <p class="mt-2 text-xs text-red-300">
+                      Upload the same JSON that was downloaded via the <b>Export Back in Stock</b> button. Every request whose <code>id</code> exists on this store will be deleted.
+                    </p>
+                  </form>
+                </div>
+              @endif
 
               @if (($conf['key'] ?? null) === 'contacts')
                 <!-- NEW SYNC BUTTONS -->

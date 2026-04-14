@@ -70,41 +70,6 @@ class WixCategoryController extends Controller
         $appNamespace = $this->treeAppNamespaceFromRequest();
         $treeKey      = $this->treeKeyFromRequest();
 
-        $buildSeoFromDesc = function (?string $desc): ?array {
-            $desc = trim(preg_replace('/\s+/u', ' ', strip_tags((string)$desc)));
-            if ($desc === '') return null;
-            // Reasonable meta length
-            $desc = mb_substr($desc, 0, 300, 'UTF-8');
-            return [
-                'tags' => [[
-                    'type'  => 'meta',
-                    'props' => [
-                        'fields' => [
-                            'name'    => ['stringValue' => 'description'],
-                            'content' => ['stringValue' => $desc],
-                        ]
-                    ],
-                ]]
-            ];
-        };
-
-        $ensureSeoOnPayload = function (array &$payload, array $source) use ($buildSeoFromDesc) {
-            // If seoData missing meta description, build from description
-            $hasMeta = false;
-            if (isset($payload['seoData']['tags']) && is_array($payload['seoData']['tags'])) {
-                foreach ($payload['seoData']['tags'] as $t) {
-                    if (($t['type'] ?? '') === 'meta'
-                        && strtolower($t['props']['fields']['name']['stringValue'] ?? '') === 'description') {
-                        $hasMeta = true; break;
-                    }
-                }
-            }
-            if (!$hasMeta) {
-                $seo = $buildSeoFromDesc($payload['description'] ?? ($source['description'] ?? null));
-                if ($seo) $payload['seoData'] = $seo;
-            }
-        };
-
         $getV3Detail = function (string $id) use ($toToken, $appNamespace, $treeKey) {
             return $this->getCategoryByIdV3($toToken, $id, $appNamespace, $treeKey);
         };
@@ -275,7 +240,6 @@ class WixCategoryController extends Controller
                 if ($dstIsV3 && $allProductsIdV3) {
                     $patch = $this->sanitizeCategoryForCreateV3($cat);
                     unset($patch['slug']); // keep core slug intact
-                    $ensureSeoOnPayload($patch, $cat);
 
                     $res = $patchV3($allProductsIdV3, $patch);
                     if (isset($res['category']['id'])) {
@@ -331,7 +295,6 @@ class WixCategoryController extends Controller
 
             if ($dstIsV3) {
                 $payload = $this->sanitizeCategoryForCreateV3($cat);
-                $ensureSeoOnPayload($payload, $cat);
 
                 // Prefer the row's existing destination id if present
                 $targetId = $row->destination_collection_id ?: null;
@@ -884,38 +847,6 @@ class WixCategoryController extends Controller
     $appNamespace = $this->treeAppNamespaceFromRequest();
     $treeKey      = $this->treeKeyFromRequest();
 
-    $buildSeoFromDesc = function (?string $desc): ?array {
-        $desc = trim(preg_replace('/\s+/u', ' ', strip_tags((string)$desc)));
-        if ($desc === '') return null;
-        $desc = mb_substr($desc, 0, 300, 'UTF-8');
-        return [
-            'tags' => [[
-                'type'  => 'meta',
-                'props' => [
-                    'fields' => [
-                        'name'    => ['stringValue' => 'description'],
-                        'content' => ['stringValue' => $desc],
-                    ]
-                ],
-            ]]
-        ];
-    };
-    $ensureSeoOnPayload = function (array &$payload, array $source) use ($buildSeoFromDesc) {
-        $hasMeta = false;
-        if (isset($payload['seoData']['tags']) && is_array($payload['seoData']['tags'])) {
-            foreach ($payload['seoData']['tags'] as $t) {
-                if (($t['type'] ?? '') === 'meta'
-                    && strtolower($t['props']['fields']['name']['stringValue'] ?? '') === 'description') {
-                    $hasMeta = true; break;
-                }
-            }
-        }
-        if (!$hasMeta) {
-            $seo = $buildSeoFromDesc($payload['description'] ?? ($source['description'] ?? null));
-            if ($seo) $payload['seoData'] = $seo;
-        }
-    };
-
     $getV3Detail = function (string $id) use ($accessToken, $appNamespace, $treeKey) {
         return $this->getCategoryByIdV3($accessToken, $id, $appNamespace, $treeKey);
     };
@@ -1014,7 +945,6 @@ class WixCategoryController extends Controller
             if ($this->shouldSkipSystemCategory($cat) && $allProductsIdV3) {
                 $patch = $this->sanitizeCategoryForCreateV3($cat);
                 unset($patch['slug']);
-                $ensureSeoOnPayload($patch, $cat);
 
                 $res = $patchV3($allProductsIdV3, $patch);
                 if (isset($res['category']['id'])) {
@@ -1033,7 +963,6 @@ class WixCategoryController extends Controller
             if ($this->shouldSkipSystemCategory($cat)) continue;
 
             $payload = $this->sanitizeCategoryForCreateV3($cat);
-            $ensureSeoOnPayload($payload, $cat);
 
             // Prefer DB destination id if present
             $targetId = $row->destination_collection_id ?: null;

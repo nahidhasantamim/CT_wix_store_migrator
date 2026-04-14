@@ -1916,21 +1916,22 @@ class WixProductController extends Controller
 
         $workInfoSections       = $product['infoSections'] ?? [];
         $workInfoSectionsExport = $product['infoSections_export'] ?? [];
-        if (empty($workInfoSections) && !empty($product['additionalInfoSections'])) {
-            $workInfoSections = [];
-            $workInfoSectionsExport = [];
-            $i = 0;
-            foreach ((array)$product['additionalInfoSections'] as $ais) {
-                $title  = trim((string)($ais['title'] ?? 'Info Section'));
-                $unique = $this->slugifyUnique($title ?: ('info-section-'.(++$i)));
-                $workInfoSections[] = ['uniqueName' => $unique, 'title' => $title];
-                $workInfoSectionsExport[] = [
-                    'uniqueName'       => $unique,
-                    'title'            => $title,
-                    'plainDescription' => $ais['description'] ?? $ais['descriptionHtml'] ?? ($ais['descriptionPlainText'] ?? '')
-                ];
-            }
-        }
+        // NOTE: additionalInfoSections fallback disabled — not migrating these for now.
+        // if (empty($workInfoSections) && !empty($product['additionalInfoSections'])) {
+        //     $workInfoSections = [];
+        //     $workInfoSectionsExport = [];
+        //     $i = 0;
+        //     foreach ((array)$product['additionalInfoSections'] as $ais) {
+        //         $title  = trim((string)($ais['title'] ?? 'Info Section'));
+        //         $unique = $this->slugifyUnique($title ?: ('info-section-'.(++$i)));
+        //         $workInfoSections[] = ['uniqueName' => $unique, 'title' => $title];
+        //         $workInfoSectionsExport[] = [
+        //             'uniqueName'       => $unique,
+        //             'title'            => $title,
+        //             'plainDescription' => $ais['description'] ?? $ais['descriptionHtml'] ?? ($ais['descriptionPlainText'] ?? '')
+        //         ];
+        //     }
+        // }
 
         $infoSectionRefs = [];
         if ($workInfoSections) {
@@ -3016,21 +3017,22 @@ class WixProductController extends Controller
 
         $workInfoSections       = $product['infoSections'] ?? [];
         $workInfoSectionsExport = $product['infoSections_export'] ?? [];
-        if (empty($workInfoSections) && !empty($product['additionalInfoSections'])) {
-            $workInfoSections = [];
-            $workInfoSectionsExport = [];
-            $i = 0;
-            foreach ((array)$product['additionalInfoSections'] as $ais) {
-                $title  = trim((string)($ais['title'] ?? 'Info Section'));
-                $unique = $this->slugifyUnique($title ?: ('info-section-'.(++$i)));
-                $workInfoSections[] = ['uniqueName' => $unique, 'title' => $title];
-                $workInfoSectionsExport[] = [
-                    'uniqueName'       => $unique,
-                    'title'            => $title,
-                    'plainDescription' => $ais['description'] ?? $ais['descriptionHtml'] ?? ($ais['descriptionPlainText'] ?? '')
-                ];
-            }
-        }
+        // NOTE: additionalInfoSections fallback disabled — not migrating these for now.
+        // if (empty($workInfoSections) && !empty($product['additionalInfoSections'])) {
+        //     $workInfoSections = [];
+        //     $workInfoSectionsExport = [];
+        //     $i = 0;
+        //     foreach ((array)$product['additionalInfoSections'] as $ais) {
+        //         $title  = trim((string)($ais['title'] ?? 'Info Section'));
+        //         $unique = $this->slugifyUnique($title ?: ('info-section-'.(++$i)));
+        //         $workInfoSections[] = ['uniqueName' => $unique, 'title' => $title];
+        //         $workInfoSectionsExport[] = [
+        //             'uniqueName'       => $unique,
+        //             'title'            => $title,
+        //             'plainDescription' => $ais['description'] ?? $ais['descriptionHtml'] ?? ($ais['descriptionPlainText'] ?? '')
+        //         ];
+        //     }
+        // }
 
         $infoSectionRefs = [];
         if ($workInfoSections) {

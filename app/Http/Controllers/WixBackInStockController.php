@@ -3,8 +3,10 @@
 namespace App\Http\Controllers;
 
 use App\Helpers\WixHelper;
+use App\Models\WixBackInStockMigration;
 use App\Models\WixProductMigration;
 use App\Models\WixStore;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
@@ -35,6 +37,19 @@ class WixBackInStockController extends Controller
         if (!is_array($rows)) {
             return back()->with('error', 'Failed to fetch BIS data.');
         }
+
+        // Oldest-first so the destination store ends up in the same chronological order.
+        $createdAtMillis = function (array $item): int {
+            foreach (['createdDate', '_createdDate', 'dateCreated', 'createdAt'] as $k) {
+                if (!empty($item[$k])) {
+                    $v = $item[$k];
+                    if (is_numeric($v)) return (int)$v;
+                    if (is_string($v)) { $ts = strtotime($v); if ($ts !== false) return $ts * 1000; }
+                }
+            }
+            return PHP_INT_MAX;
+        };
+        usort($rows, fn($a, $b) => $createdAtMillis($a) <=> $createdAtMillis($b));
 
         $created  = 0;
         $existing = 0;
@@ -95,7 +110,7 @@ class WixBackInStockController extends Controller
         );
     }
 
-    public function export(WixStore $store)
+    public function export(WixStore $store, Request $request)
     {
         $storeId = $store->instance_id;
         $token   = WixHelper::getAccessToken($storeId);
@@ -104,10 +119,44 @@ class WixBackInStockController extends Controller
             return back()->with('error', 'Access denied.');
         }
 
-        $rows = $this->fetchBackInStock($token);
+        $sortOrder = strtoupper((string) $request->input('sort_order', 'ASC'));
+        if (!in_array($sortOrder, ['ASC', 'DESC'], true)) {
+            $sortOrder = 'ASC';
+        }
+
+        $limitRaw = $request->input('limit');
+        $limit    = (is_numeric($limitRaw) && (int) $limitRaw > 0) ? (int) $limitRaw : null;
+
+        WixHelper::log('BIS EXPORT', "Start: store={$storeId} sort={$sortOrder} limit=".($limit ?: 'all'), 'info');
+
+        // When a limit is set, ask Wix to do the sort+paging server-side.
+        // Otherwise fetch all rows and sort client-side below.
+        $queryOptions = [];
+        if ($limit !== null) {
+            $queryOptions['limit']      = $limit;
+            $queryOptions['sort_order'] = $sortOrder;
+        }
+
+        $rows = $this->fetchBackInStock($token, $queryOptions);
         if (!is_array($rows)) {
             return back()->with('error', 'Failed to fetch BIS data.');
         }
+
+        // Output is ALWAYS oldest-first regardless of how we fetched, so imports
+        // replay in the same chronological order as the source store.
+        $createdAtMillis = function (array $item): int {
+            foreach (['createdDate', '_createdDate', 'dateCreated', 'createdAt'] as $k) {
+                if (!empty($item[$k])) {
+                    $v = $item[$k];
+                    if (is_numeric($v)) return (int)$v;
+                    if (is_string($v)) { $ts = strtotime($v); if ($ts !== false) return $ts * 1000; }
+                }
+            }
+            return PHP_INT_MAX;
+        };
+        usort($rows, fn($a, $b) => $createdAtMillis($a) <=> $createdAtMillis($b));
+
+        WixHelper::log('BIS EXPORT', "Exporting ".count($rows)." row(s) (sort={$sortOrder}, limit=".($limit ?: 'all').")", 'info');
 
         foreach ($rows as &$row) {
             $productId = data_get($row, 'catalogReference.catalogItemId');
@@ -163,15 +212,53 @@ class WixBackInStockController extends Controller
             return back()->with('error', 'Invalid JSON.');
         }
 
-        WixHelper::log('BIS IMPORT', "Manual import start → {$toStoreId}", 'info');
+        // Force oldest-first regardless of the file's own ordering so the destination
+        // store ends up in the same chronological sequence as the source.
+        $createdAtMillis = function (array $item): int {
+            foreach (['createdDate', '_createdDate', 'dateCreated', 'createdAt'] as $k) {
+                if (!empty($item[$k])) {
+                    $v = $item[$k];
+                    if (is_numeric($v)) return (int)$v;
+                    if (is_string($v)) { $ts = strtotime($v); if ($ts !== false) return $ts * 1000; }
+                }
+            }
+            return PHP_INT_MAX;
+        };
+        usort($rows, fn($a, $b) => $createdAtMillis($a) <=> $createdAtMillis($b));
 
-        $created  = 0;
-        $existing = 0;
-        $skipped  = 0;
-        $failed   = 0;
+        WixHelper::log('BIS IMPORT', "Manual import start → {$toStoreId} (".count($rows)." row(s), sorted oldest-first)", 'info');
+
+        $userId = Auth::id() ?: 1;
+
+        $created       = 0;
+        $existing      = 0;
+        $skipped       = 0;
+        $failed        = 0;
+        $alreadyDone   = 0;
 
         foreach ($rows as $row) {
+            $sourceRequestId = data_get($row, 'id')
+                ?? data_get($row, 'request.id')
+                ?? data_get($row, 'requestId');
             $sourceProductId = data_get($row, 'catalogReference.catalogItemId');
+            $sourceVariantId = data_get($row, 'catalogReference.options.variantId');
+            $sourceEmail     = data_get($row, 'email');
+
+            // Skip rows already successfully migrated to this destination.
+            if ($sourceRequestId) {
+                $existingRow = WixBackInStockMigration::query()
+                    ->where('user_id', $userId)
+                    ->where('to_store_id', $toStoreId)
+                    ->where('source_request_id', $sourceRequestId)
+                    ->where('status', 'success')
+                    ->first();
+
+                if ($existingRow) {
+                    $alreadyDone++;
+                    WixHelper::log('BIS IMPORT', "Skip (already migrated successfully): source_request_id={$sourceRequestId}", 'debug');
+                    continue;
+                }
+            }
 
             $migration = WixProductMigration::query()
                 ->whereNotNull('destination_product_id')
@@ -183,6 +270,7 @@ class WixBackInStockController extends Controller
             if (!$migration) {
                 WixHelper::log('BIS IMPORT', "No migration row for {$sourceProductId}", 'warn');
                 $skipped++;
+                $this->upsertBisMigration($userId, null, $toStoreId, $sourceRequestId, $sourceEmail, $sourceProductId, $sourceVariantId, null, null, 'skipped', 'No product migration row');
                 continue;
             }
 
@@ -197,6 +285,7 @@ class WixBackInStockController extends Controller
 
             if (!$payload) {
                 $skipped++;
+                $this->upsertBisMigration($userId, $fromStoreId, $toStoreId, $sourceRequestId, $sourceEmail, $sourceProductId, $sourceVariantId, $migration->destination_product_id, null, 'skipped', 'Could not build payload');
                 continue;
             }
 
@@ -210,6 +299,8 @@ class WixBackInStockController extends Controller
             // REAL CREATE
             if ($http === 200 || $http === 201) {
                 $created++;
+                $destinationRequestId = data_get($body, 'request.id') ?? data_get($body, 'id');
+                $this->upsertBisMigration($userId, $fromStoreId, $toStoreId, $sourceRequestId, $sourceEmail, $sourceProductId, $sourceVariantId, $migration->destination_product_id, $destinationRequestId, 'success', null);
                 continue;
             }
 
@@ -217,6 +308,7 @@ class WixBackInStockController extends Controller
             if ($code === 'BACK_IN_STOCK_NOTIFICATION_REQUEST_ALREADY_EXISTS') {
                 $existing++;
                 WixHelper::log('BIS IMPORT', 'Already exists – no action needed', 'info');
+                $this->upsertBisMigration($userId, $fromStoreId, $toStoreId, $sourceRequestId, $sourceEmail, $sourceProductId, $sourceVariantId, $migration->destination_product_id, null, 'success', 'Already existed on destination');
                 continue;
             }
 
@@ -227,31 +319,147 @@ class WixBackInStockController extends Controller
             ) {
                 $skipped++;
                 WixHelper::log('BIS IMPORT', 'Contacts allocator error – skipped', 'warn');
+                $this->upsertBisMigration($userId, $fromStoreId, $toStoreId, $sourceRequestId, $sourceEmail, $sourceProductId, $sourceVariantId, $migration->destination_product_id, null, 'skipped', 'Contacts allocator error');
                 continue;
             }
 
             // REAL FAILURE
             $failed++;
             WixHelper::log('BIS IMPORT', 'Create failed: ' . json_encode($body), 'error');
+            $this->upsertBisMigration($userId, $fromStoreId, $toStoreId, $sourceRequestId, $sourceEmail, $sourceProductId, $sourceVariantId, $migration->destination_product_id, null, 'failed', json_encode($body));
         }
 
         return back()->with(
             'success',
-            "Created={$created}, Existing={$existing}, Skipped={$skipped}, Failed={$failed}"
+            "Created={$created}, Existing={$existing}, AlreadyDone={$alreadyDone}, Skipped={$skipped}, Failed={$failed}"
         );
     }
 
-    private function fetchBackInStock(string $token): ?array
+    private function upsertBisMigration(
+        int $userId,
+        ?string $fromStoreId,
+        string $toStoreId,
+        ?string $sourceRequestId,
+        ?string $sourceEmail,
+        ?string $sourceProductId,
+        ?string $sourceVariantId,
+        ?string $destinationProductId,
+        ?string $destinationRequestId,
+        string $status,
+        ?string $errorMessage
+    ): void {
+        if (!$sourceRequestId) {
+            return;
+        }
+
+        try {
+            WixBackInStockMigration::updateOrCreate(
+                [
+                    'user_id'           => $userId,
+                    'to_store_id'       => $toStoreId,
+                    'source_request_id' => $sourceRequestId,
+                ],
+                [
+                    'from_store_id'          => $fromStoreId,
+                    'source_email'           => $sourceEmail,
+                    'source_product_id'      => $sourceProductId,
+                    'source_variant_id'      => $sourceVariantId,
+                    'destination_product_id' => $destinationProductId,
+                    'destination_request_id' => $destinationRequestId,
+                    'status'                 => $status,
+                    'error_message'          => $errorMessage,
+                ]
+            );
+        } catch (\Throwable $e) {
+            WixHelper::log('BIS IMPORT', "DB upsert failed for source_request_id={$sourceRequestId}: ".$e->getMessage(), 'error');
+        }
+    }
+
+    private function fetchBackInStock(string $token, array $queryOptions = []): ?array
     {
-        $resp = Http::withHeaders([
+        $endpoint = 'https://www.wixapis.com/back-in-stock-service/v1/back-in-stock-notification-requests/query';
+
+        $authHeaders = [
             'Authorization' => str_starts_with($token, 'Bearer') ? $token : "Bearer {$token}",
             'Content-Type'  => 'application/json',
-        ])->post(
-            'https://www.wixapis.com/back-in-stock-service/v1/back-in-stock-notification-requests/query',
-            ['query' => new \stdClass()]
-        );
+        ];
 
-        return $resp->ok() ? ($resp->json()['requests'] ?? []) : null;
+        // If a limit is specified, use a single server-side query with sort + paging
+        // (matches the Wix docs example: sort by createdDate ASC/DESC, paging.limit).
+        if (!empty($queryOptions['limit'])) {
+            $limit = max(1, min(100, (int) $queryOptions['limit']));
+            $order = strtoupper((string) ($queryOptions['sort_order'] ?? 'ASC')) === 'DESC' ? 'DESC' : 'ASC';
+
+            $body = [
+                'query' => [
+                    'sort' => [
+                        ['fieldName' => 'createdDate', 'order' => $order],
+                    ],
+                    'paging' => [
+                        'limit' => $limit,
+                    ],
+                ],
+            ];
+
+            $resp = Http::withHeaders($authHeaders)->post($endpoint, $body);
+
+            if (!$resp->ok()) {
+                WixHelper::log('BIS', 'Query failed: status='.$resp->status().' body='.$resp->body(), 'error');
+                return null;
+            }
+
+            $json = $resp->json() ?: [];
+            $rows = $json['requests'] ?? [];
+            if (!is_array($rows)) $rows = [];
+
+            WixHelper::log('BIS', "Server-side query returned ".count($rows)." row(s) (sort={$order}, limit={$limit})", 'debug');
+            return $rows;
+        }
+
+        // No limit → paginate everything via offset-based `paging` (BIS endpoint
+        // uses this format per Wix docs; cursorPaging returns only page 1 here).
+        $pageLimit = 100;
+        $all       = [];
+        $offset    = 0;
+        $pages     = 0;
+        $maxPages  = 1000; // hard safety ceiling (100k rows)
+
+        do {
+            $body = [
+                'query' => [
+                    'sort' => [
+                        ['fieldName' => 'createdDate', 'order' => 'ASC'],
+                    ],
+                    'paging' => [
+                        'limit'  => $pageLimit,
+                        'offset' => $offset,
+                    ],
+                ],
+            ];
+
+            $resp = Http::withHeaders($authHeaders)->post($endpoint, $body);
+
+            if (!$resp->ok()) {
+                WixHelper::log('BIS', 'Query failed: status='.$resp->status().' body='.$resp->body(), 'error');
+                return null;
+            }
+
+            $json      = $resp->json() ?: [];
+            $batch     = $json['requests'] ?? [];
+            if (!is_array($batch)) $batch = [];
+            $batchSize = count($batch);
+
+            $all = array_merge($all, $batch);
+
+            $offset += $batchSize;
+            $pages++;
+
+            if ($batchSize < $pageLimit) break;
+        } while ($pages < $maxPages);
+
+        WixHelper::log('BIS', "Paginated fetch complete: pages={$pages} total=".count($all), 'debug');
+
+        return $all;
     }
 
     private function getPublishedSiteBaseUrl(string $token, string $storeId): ?string
@@ -554,5 +762,91 @@ class WixBackInStockController extends Controller
             'request_id'  => $requestId,
         ];
         // =============Request ID Block============
+    }
+
+    public function deleteFromJson(Request $request, WixStore $store)
+    {
+        $toStoreId = $store->instance_id;
+        $token     = WixHelper::getAccessToken($toStoreId);
+
+        if (!$token) {
+            return back()->with('error', 'Token missing.');
+        }
+
+        if (!$request->hasFile('back_in_stock_json')) {
+            return back()->with('error', 'No file uploaded.');
+        }
+
+        $decoded = json_decode(
+            file_get_contents($request->file('back_in_stock_json')->getRealPath()),
+            true
+        );
+
+        $rows = data_get($decoded, 'back_in_stock_requests');
+        if (!is_array($rows)) {
+            return back()->with('error', 'Invalid JSON.');
+        }
+
+        WixHelper::log('BIS DELETE', "Manual delete start → {$toStoreId} (".count($rows)." row(s))", 'info');
+
+        $deleted  = 0;
+        $notFound = 0;
+        $skipped  = 0;
+        $failed   = 0;
+
+        foreach ($rows as $row) {
+            $id = data_get($row, 'id') ?? data_get($row, 'request.id') ?? data_get($row, 'requestId');
+
+            if (!$id) {
+                $skipped++;
+                WixHelper::log('BIS DELETE', 'Row missing id, skipped', 'warn');
+                continue;
+            }
+
+            $result = $this->deleteBackInStock($token, $id);
+            $http   = $result['http_status'];
+
+            if ($http === 200 || $http === 204) {
+                $deleted++;
+                continue;
+            }
+
+            if ($http === 404) {
+                $notFound++;
+                WixHelper::log('BIS DELETE', "Not found on target (already deleted?): {$id}", 'info');
+                continue;
+            }
+
+            $failed++;
+            WixHelper::log('BIS DELETE', "Delete failed for {$id}: status={$http} body=".json_encode($result['body'] ?? []), 'error');
+        }
+
+        WixHelper::log('BIS DELETE', "Done. deleted={$deleted}, notFound={$notFound}, skipped={$skipped}, failed={$failed}", $failed ? 'warn' : 'success');
+
+        return back()->with(
+            $failed ? 'warning' : 'success',
+            "Deleted={$deleted}, NotFound={$notFound}, Skipped={$skipped}, Failed={$failed}"
+        );
+    }
+
+    private function deleteBackInStock(string $token, string $id): array
+    {
+        $resp = Http::withHeaders([
+                'Authorization' => str_starts_with($token, 'Bearer') ? $token : "Bearer {$token}",
+                'Content-Type'  => 'application/json',
+            ])
+            ->timeout(20)
+            ->retry(3, 400, function ($e) {
+                return $e instanceof ConnectionException;
+            }, throw: false)
+            ->delete(
+                "https://www.wixapis.com/back-in-stock-service/v1/back-in-stock-notification-requests/{$id}"
+            );
+
+        return [
+            'http_status' => $resp->status(),
+            'ok'          => $resp->ok(),
+            'body'        => $resp->json(),
+        ];
     }
 }

@@ -414,7 +414,6 @@ class WixGiftCardController extends Controller
             'limit'        => $limit,
             'created_from' => $createdFrom,
             'created_to'   => $createdTo,
-            'sort_order'   => 'ASC',
         ];
 
         $resp = $this->getGiftCardsFromWix($accessToken, $queryOptions);
@@ -710,23 +709,28 @@ class WixGiftCardController extends Controller
             'cursorPaging' => ['limit' => $limit],
         ];
 
-        $createdFilter = [];
-        if (!empty($queryOptions['created_from'])) $createdFilter['$gte'] = $queryOptions['created_from'];
-        if (!empty($queryOptions['created_to']))   $createdFilter['$lte'] = $queryOptions['created_to'];
-        if ($createdFilter) {
-            $query['filter']['createdDate'] = $createdFilter;
+        // Wix rejects multiple operators ($gte + $lte) in the same object — wrap in $and.
+        $andClauses = [];
+        if (!empty($queryOptions['created_from'])) {
+            $andClauses[] = ['createdDate' => ['$gte' => $queryOptions['created_from']]];
         }
-
-        if (!empty($queryOptions['sort_order'])) {
-            $query['sort'] = [[
-                'fieldName' => 'createdDate',
-                'order'     => strtoupper($queryOptions['sort_order']) === 'DESC' ? 'DESC' : 'ASC',
-            ]];
+        if (!empty($queryOptions['created_to'])) {
+            $andClauses[] = ['createdDate' => ['$lte' => $queryOptions['created_to']]];
+        }
+        if (count($andClauses) === 1) {
+            $query['filter'] = $andClauses[0];
+        } elseif (count($andClauses) > 1) {
+            $query['filter'] = ['$and' => $andClauses];
         }
 
         do {
-            $body = ['query' => $query];
-            if ($cursor) $body['query']['cursorPaging']['cursor'] = $cursor;
+            // Wix requires cursor-only paging on subsequent pages — filter/sort
+            // are encoded in the cursor itself and must NOT be re-sent.
+            if ($cursor) {
+                $body = ['query' => ['cursorPaging' => ['limit' => $limit, 'cursor' => $cursor]]];
+            } else {
+                $body = ['query' => $query];
+            }
 
             $response = Http::withHeaders([
                 'Authorization' => $ensureBearer($accessToken),
